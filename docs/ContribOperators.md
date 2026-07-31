@@ -936,6 +936,8 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>Fused activation function. One of: 'silu', 'swish', 'none'. Default is 'none'.</dd>
 <dt><tt>ndim</tt> : int</dt>
 <dd>Spatial dimensionality: 1, 2, or 3. Default is 1.</dd>
+<dt><tt>state_window</tt> : int</dt>
+<dd>Number of trailing per-position carry states held by past_state and present_state. When 0 (default) the state tensors have no window axis and hold only the state after the last position, i.e. the backward-compatible (batch_size, channels, k_1 - 1). When W > 0 both gain a LEADING axis of extent W, right-aligned: slot j is the state after position (seq_len - W + j), so slot W-1 is always the state after the last position (identical to the W = 0 tensor) and is the slot past_state is read from. The window axis leads the batch axis so that each slot is one contiguous (batch_size, channels, k_1 - 1) block. Slots below max(0, W - seq_len) are not written. A window lets a speculative decoder roll the state back to an accepted prefix without replaying the forward.</dd>
 </dl>
 
 #### Inputs (2 - 4)
@@ -948,7 +950,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>bias</tt> (optional) : T</dt>
 <dd>Optional per-channel bias with shape (channels).</dd>
 <dt><tt>past_state</tt> (optional) : T</dt>
-<dd>Carry state from previous step. For ndim=1: (batch_size, channels, k_1 - 1). If not provided, padding is zero.</dd>
+<dd>Carry state from previous step. For ndim=1: (batch_size, channels, k_1 - 1), or (W, batch_size, channels, k_1 - 1) when state_window = W > 0, in which case only slot W-1 is read. If not provided, padding is zero.</dd>
 </dl>
 
 #### Outputs
@@ -957,7 +959,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>output</tt> : T</dt>
 <dd>Convolution output with same shape as input.</dd>
 <dt><tt>present_state</tt> : T</dt>
-<dd>Updated carry state. For ndim=1: (batch_size, channels, k_1 - 1). Contains the last (k-1) values from the virtual input along the causal axis.</dd>
+<dd>Updated carry state. For ndim=1: (batch_size, channels, k_1 - 1), or (W, batch_size, channels, k_1 - 1) when state_window = W > 0. Slot W-1 contains the last (k-1) values from the virtual input along the causal axis; slot j contains the same for the prefix ending at position (seq_len - W + j).</dd>
 </dl>
 
 #### Type Constraints
@@ -2813,6 +2815,8 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>Number of query heads. Always required.</dd>
 <dt><tt>scale</tt> : float</dt>
 <dd>Output scaling factor. When 0.0 (default), derives d_k = query.shape[-1] / q_num_heads and uses 1/sqrt(d_k). Set explicitly to override.</dd>
+<dt><tt>state_window</tt> : int</dt>
+<dd>Number of trailing per-token recurrent states held by past_state and present_state. When 0 (default) the state tensors are 4D and hold only the state after the last token, i.e. the backward-compatible (B, H_kv, d_k, d_v). When W > 0 both are 5D with a LEADING axis of extent W, right-aligned: slot j is the state after token (T - W + j), so slot W-1 is always the state after the last token (identical to the W = 0 tensor) and is the slot past_state is read from. The window axis leads the batch axis so that each slot is one contiguous (B, H_kv, d_k, d_v) block. Slots below max(0, W - T) are not written. A window lets a speculative decoder roll the state back to an accepted prefix without replaying the forward.</dd>
 <dt><tt>update_rule</tt> : string</dt>
 <dd>The update rule for the linear attention recurrence. One of: 'linear', 'gated', 'delta', 'gated_delta'. Default is 'gated_delta'.</dd>
 </dl>
@@ -2827,7 +2831,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>value</tt> : T</dt>
 <dd>Value vectors with 3D packed shape (B, T, H_kv * d_v).</dd>
 <dt><tt>past_state</tt> (optional) : S</dt>
-<dd>Recurrent state from previous step with shape (B, H_kv, d_k, d_v). Always 4D. If not provided, defaults to zeros.</dd>
+<dd>Recurrent state from previous step with shape (B, H_kv, d_k, d_v), or (W, B, H_kv, d_k, d_v) when state_window = W > 0, in which case only slot W-1 is read. If not provided, defaults to zeros.</dd>
 <dt><tt>decay</tt> (optional) : T</dt>
 <dd>Exponential decay gate in log-space. 3D packed shape: (B, T, H_kv * d_k) for per-key-dimension decay (GLA/RWKV-6), or (B, T, H_kv) for per-head scalar decay (DeltaNet/RetNet). Required for 'gated' and 'gated_delta' modes.</dd>
 <dt><tt>beta</tt> (optional) : T</dt>
@@ -2840,7 +2844,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>output</tt> : T</dt>
 <dd>Attention output with 3D packed shape (B, T, H_q * d_v).</dd>
 <dt><tt>present_state</tt> : S</dt>
-<dd>Updated recurrent state with shape (B, H_kv, d_k, d_v). Always 4D.</dd>
+<dd>Updated recurrent state with shape (B, H_kv, d_k, d_v), or (W, B, H_kv, d_k, d_v) when state_window = W > 0. Slot W-1 is the state after the last token; slot j is the state after token (T - W + j).</dd>
 </dl>
 
 #### Type Constraints
