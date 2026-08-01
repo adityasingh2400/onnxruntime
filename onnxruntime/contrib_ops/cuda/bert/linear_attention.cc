@@ -71,6 +71,8 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
   const int seq_len = static_cast<int>(query_shape[1]);
   const int query_hidden = static_cast<int>(query_shape[2]);
 
+  ORT_RETURN_IF_NOT(seq_len > 0, "sequence length must be positive, got ", seq_len);
+
   ORT_RETURN_IF_NOT(key_tensor != nullptr && value_tensor != nullptr, "key and value inputs are required");
 
   const auto& key_shape = key_tensor->Shape();
@@ -185,6 +187,7 @@ Status LinearAttention<T>::ComputeInternal(OpKernelContext* context) const {
       needs_beta,
       beta_per_head,
       needs_retrieval,
+      GetDeviceProp().multiProcessorCount,
       GetDeviceProp().maxThreadsPerBlock,
       state_slots);
 }
