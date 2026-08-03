@@ -76,8 +76,9 @@ option(onnxruntime_USE_CUDA "Build with CUDA support" OFF)
 cmake_dependent_option(onnxruntime_ENABLE_CUDA_EP_INTERNAL_TESTS "Build with CUDA unit tests" OFF "onnxruntime_USE_CUDA;onnxruntime_BUILD_UNIT_TESTS" OFF)
 
 cmake_dependent_option(onnxruntime_USE_CUDA_NHWC_OPS "Build CUDA with NHWC op support" ON "onnxruntime_USE_CUDA" OFF)
-cmake_dependent_option(onnxruntime_BUILD_CUDA_EP_AS_PLUGIN "Build CUDA EP as a separate plugin shared library" OFF "onnxruntime_USE_CUDA" OFF)
-option(onnxruntime_CUDA_MINIMAL "Build CUDA without any operations apart from memcpy ops. Usefuel for a very minial TRT build" OFF)
+cmake_dependent_option(onnxruntime_BUILD_CUDA_EP_AS_PLUGIN "Build CUDA EP as a separate plugin shared library instead of the legacy in-tree provider" OFF "onnxruntime_USE_CUDA" OFF)
+option(onnxruntime_BUILD_CUDA_QUANT_PREPROCESS "Build CUDA weight-packing module onnxruntime_cuda_quant_preprocess.so" OFF)
+option(onnxruntime_CUDA_MINIMAL "Build CUDA without any operations apart from memcpy ops. Useful for a very minimal TRT build" OFF)
 option(onnxruntime_ENABLE_CUDA_LINE_NUMBER_INFO "When building with CUDA support, generate device code line number information." OFF)
 option(onnxruntime_USE_OPENVINO "Build with OpenVINO support" OFF)
 option(onnxruntime_USE_COREML "Build with CoreML support" OFF)
@@ -90,11 +91,29 @@ option(onnxruntime_USE_DNNL "Build with DNNL support" OFF)
 option(onnxruntime_USE_JSEP "Build with JavaScript implemented kernels support" OFF)
 option(onnxruntime_USE_SVE "Build with SVE support in MLAS" OFF)
 option(onnxruntime_USE_RVV "Build with RISC-V Vector support in MLAS" OFF)
+option(onnxruntime_USE_RVV_ZVFH "Build with RISC-V Zvfh (FP16 vector) support in MLAS" OFF)
 option(onnxruntime_USE_ARM_NEON_NCHWC "Build with ARM Neon NCHWc kernels in MLAS" OFF)
 
 option(onnxruntime_USE_KLEIDIAI "Build with KleidiAI integration in MLAS" OFF)
 option(onnxruntime_USE_QMX_KLEIDIAI_COEXIST "Build with QMX and Arm KLEIDIAI libraries" OFF)
 option(onnxruntime_BUILD_UNIT_TESTS "Build ONNXRuntime unit tests" ON)
+# Materialize the ONNX node-test corpus from ONNX's Python generators into the build tree at
+# configure/build time, instead of depending on the on-disk corpus shipped in the ONNX source
+# archive. This detaches ORT from ONNX PR #7959 (which deletes onnx/backend/test/data/node).
+#
+# Defaults OFF -- it is an explicit opt-in, enabled only on CI legs that (a) install the pinned
+# onnx + numpy pre-build and (b) actually consume the materialized node corpus (the QNN legs and
+# one Linux CPU leg that runs the equivalence + materialized-node ctests), via
+# `--cmake_extra_defines onnxruntime_MATERIALIZE_ONNX_NODE_TESTS=ON`. Legs that leave it OFF keep
+# their pre-existing behavior (node tests are read from the FetchContent'd ONNX source tree, which
+# still ships data/node on the pinned version), so the default is a zero-regression no-op today.
+#
+# When explicitly set ON, the configure step FAILS LOUDLY if onnx/numpy are missing or off-pin
+# (it does NOT silently skip) -- the loud contract is preserved exactly where materialization is
+# requested. On reduced/minimal builds the dependent condition forces it OFF regardless.
+cmake_dependent_option(onnxruntime_MATERIALIZE_ONNX_NODE_TESTS
+  "Materialize the ONNX node-test corpus into the build tree (opt-in; needs onnx+numpy)." OFF
+  "onnxruntime_BUILD_UNIT_TESTS;NOT onnxruntime_REDUCED_OPS_BUILD;NOT onnxruntime_MINIMAL_BUILD" OFF)
 option(onnxruntime_BUILD_CSHARP "Build C# library" OFF)
 option(onnxruntime_BUILD_OBJC "Build Objective-C library" OFF)
 option(onnxruntime_USE_PREINSTALLED_EIGEN "Use pre-installed EIGEN. Need to provide eigen_SOURCE_PATH if turn this on." OFF)
@@ -104,7 +123,9 @@ option(onnxruntime_USE_VSINPU "Build with VSINPU support" OFF)
 cmake_dependent_option(onnxruntime_USE_FLASH_ATTENTION "Build flash attention kernel for scaled dot product attention" ON "onnxruntime_USE_CUDA" OFF)
 option(onnxruntime_USE_LEAN_ATTENTION "Build lean attention kernel for scaled dot product attention" OFF)
 cmake_dependent_option(onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION "Build memory efficient attention kernel for scaled dot product attention" ON "onnxruntime_USE_CUDA" OFF)
-option(onnxruntime_USE_FPA_INTB_GEMM "Build FpA IntB gemm cuda kernels" OFF)
+option(onnxruntime_USE_FP4_QMOE "Build CUDA QMoE FP4 kernels" OFF)
+option(onnxruntime_USE_FP8_QMOE "Build CUDA QMoE FP8 kernels" OFF)
+cmake_dependent_option(onnxruntime_USE_FPA_INTB_GEMM "Build FpA IntB gemm cuda kernels" ON "onnxruntime_USE_CUDA" OFF)
 option(onnxruntime_USE_INT4_KV_CACHE "Build cuda kernels for int4 kv cache" OFF)
 option(onnxruntime_USE_FP8_KV_CACHE "Build cuda kernels for fp8 kv cache" ON)
 option(onnxruntime_QUICK_BUILD "Speed up build by skipping some kernels for faster development" OFF)
@@ -140,13 +161,15 @@ option(onnxruntime_USE_WINML "Build with WinML support" OFF)
 option(onnxruntime_USE_ACL "Build with ACL support" OFF)
 option(onnxruntime_ENABLE_INSTRUMENT "Enable Instrument with Event Tracing for Windows (ETW)" OFF)
 option(onnxruntime_USE_TELEMETRY "Build with Telemetry" OFF)
+# Optional 1DS ingestion token for non-Windows telemetry. Leave empty to compile in the encoded
+# in-repo default from core/platform/posix/telemetry.cc; callers can override it at configure time.
+set(ONNXRUNTIME_TELEMETRY_TENANT_TOKEN "" CACHE STRING "Override the compiled-in telemetry ingestion token (non-Windows)")
 cmake_dependent_option(onnxruntime_USE_MIMALLOC "Override new/delete and arena allocator with mimalloc" OFF "WIN32;NOT onnxruntime_USE_CUDA;NOT onnxruntime_USE_OPENVINO" OFF)
 option(onnxruntime_USE_CANN "Build with CANN support" OFF)
 option(onnxruntime_USE_XNNPACK "Build with XNNPACK support. Provides an alternative math library on ARM, WebAssembly and x86." OFF)
 option(onnxruntime_USE_WEBNN "Build with WebNN support. Enable hardware acceleration in web browsers." OFF)
 option(onnxruntime_USE_WEBGPU "Build with WebGPU support. Enable WebGPU via C/C++ interface." OFF)
 option(onnxruntime_USE_EP_API_ADAPTERS "Build EP (e.g. WebGPU) as a plugin EP shared library using EP API adapters" OFF)
-option(onnxruntime_WGSL_TEMPLATE "Specify the code generator for WGSL template. Default is static." "static")
 option(onnxruntime_USE_EXTERNAL_DAWN "Build with treating Dawn as external dependency. Will not link Dawn at build time." OFF)
 option(onnxruntime_CUSTOM_DAWN_SRC_PATH "Path to custom Dawn src dir.")
 option(onnxruntime_BUILD_DAWN_SHARED_LIBRARY "Build Dawn as a shared library" OFF)
@@ -638,6 +661,7 @@ else()
   check_cxx_compiler_flag(-Wcatch-value HAS_CATCH_VALUE)
   check_cxx_compiler_flag(-Wclass-memaccess HAS_CLASS_MEMACCESS)
   check_cxx_compiler_flag(-Wcharacter-conversion HAS_CHARACTER_CONVERSION)
+  check_cxx_compiler_flag(-Wno-error=character-conversion HAS_NO_ERROR_CHARACTER_CONVERSION)
   check_cxx_compiler_flag(-Wdangling-reference HAS_DANGLING_REFERENCE)
   check_cxx_compiler_flag(-Wdeprecated-anon-enum-enum-conversion HAS_DEPRECATED_ANON_ENUM_ENUM_CONVERSION)
   check_cxx_compiler_flag(-Wdeprecated-builtins HAS_DEPRECATED_BUILTINS)
@@ -671,11 +695,17 @@ else()
   if (NOT APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten" AND onnxruntime_target_platform STREQUAL "aarch64")
    check_cxx_compiler_flag(-march=armv8.2-a+bf16 HAS_ARM64_BFLOAT16)
    if(NOT HAS_ARM64_BFLOAT16)
-     message(FATAL_ERROR  "The compiler doesn't support BFLOAT16!!!")
+     message(FATAL_ERROR "The compiler/assembler does not support the aarch64 +bf16 ISA extension. "
+       "On aarch64 this typically requires GCC >= 12 paired with a sufficiently recent binutils "
+       "(the capability is gated by the assembler, not the compiler alone). "
+       "See https://github.com/microsoft/onnxruntime/issues/22837 for details.")
    endif()
    check_cxx_compiler_flag(-march=armv8.2-a+fp16 HAS_ARM64_FLOAT16)
    if(NOT HAS_ARM64_FLOAT16)
-     message(FATAL_ERROR  "The compiler doesn't support FLOAT16!!!")
+     message(FATAL_ERROR "The compiler/assembler does not support the aarch64 +fp16 ISA extension. "
+       "On aarch64 this typically requires GCC >= 12 paired with a sufficiently recent binutils "
+       "(the capability is gated by the assembler, not the compiler alone). "
+       "See https://github.com/microsoft/onnxruntime/issues/22837 for details.")
    endif()
   endif()
 
@@ -785,8 +815,8 @@ if (onnxruntime_USE_CUDA)
     endif()
 
     if (onnxruntime_QUICK_BUILD)
-        message( STATUS "Quick build mode: Flash attention limited to head dimension 128 only")
-        list(APPEND ORT_PROVIDER_FLAGS -DORT_QUICK_BUILD=1)
+      message( STATUS "Quick build mode: reducing selected CUDA/CUTLASS kernel instantiations")
+      list(APPEND ORT_PROVIDER_FLAGS -DORT_QUICK_BUILD=1)
     endif()
 
     if (onnxruntime_USE_INT4_KV_CACHE)
@@ -1439,6 +1469,12 @@ if (Git_FOUND)
   if (onnxruntime_USE_FP8_KV_CACHE)
     string(APPEND ORT_BUILD_INFO "fp8-kv-cache=1, ")
   endif()
+  if (onnxruntime_USE_FP4_QMOE)
+    string(APPEND ORT_BUILD_INFO "fp4-qmoe=1, ")
+  endif()
+  if (onnxruntime_USE_FP8_QMOE)
+    string(APPEND ORT_BUILD_INFO "fp8-qmoe=1, ")
+  endif()
   if (onnxruntime_USE_CUDA AND onnxruntime_BUILD_CUDA_EP_AS_PLUGIN)
     string(APPEND ORT_BUILD_INFO "cuda-plugin-ep=1, ")
   endif()
@@ -1465,10 +1501,26 @@ if (onnxruntime_USE_CUDA)
   message(STATUS "CUDA Toolkit version is greater or equal than 11.8, enable -DENABLE_BF16 flag")
   add_definitions("-DENABLE_FP8")
   message(STATUS "CUDA Toolkit version is greater or equal than 11.8, enable -DENABLE_FP8 flag")
+  if(onnxruntime_USE_FP8_QMOE)
+    add_definitions("-DUSE_FP8_QMOE")
+    message(STATUS "CUDA FP8 QMoE kernels enabled")
+  endif()
 
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
     add_definitions("-DENABLE_FP4")
     message(STATUS "CUDA Toolkit version is greater or equal than 12.8, enable -DENABLE_FP4 flag")
+    if(onnxruntime_USE_FP4_QMOE)
+      if(MSVC AND ("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG OR
+                   "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
+        message(FATAL_ERROR
+          "onnxruntime_USE_FP4_QMOE with SM120/SM121 is not supported on MSVC: native sm_120a "
+          "compilation fails in CUDA/CCCL tcgen05 headers. Use a non-MSVC build for native FP4 QMoE.")
+      endif()
+      add_definitions("-DUSE_FP4_QMOE")
+      message(STATUS "CUDA FP4 QMoE kernels enabled")
+    endif()
+  elseif(onnxruntime_USE_FP4_QMOE)
+    message(FATAL_ERROR "onnxruntime_USE_FP4_QMOE requires CUDA Toolkit version 12.8 or newer")
   endif()
 
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
@@ -1775,10 +1827,6 @@ foreach(onnxruntime_cmake_file ${ONNXRUNTIME_CMAKE_FILES})
   include(${onnxruntime_cmake_file}.cmake)
 endforeach()
 
-# CUDA EP Plugin build (independent shared library)
-if (onnxruntime_USE_CUDA AND onnxruntime_BUILD_CUDA_EP_AS_PLUGIN)
-  include(onnxruntime_providers_cuda_plugin.cmake)
-endif()
 if (UNIX)
   option(BUILD_PKGCONFIG_FILES "Build and install pkg-config files" ON)
 else()
@@ -1861,6 +1909,19 @@ else()
         add_library(safeint_interface IMPORTED INTERFACE)\n\
         target_include_directories(safeint_interface INTERFACE ${safeint_SOURCE_DIR})\n\
         ")
+    if(onnxruntime_USE_TELEMETRY AND NOT WIN32 AND onnxruntime_USE_VCPKG)
+      string(APPEND PROJECT_CONFIG_CONTENT
+        "find_dependency(MSTelemetry CONFIG)\n\
+        ")
+    endif()
+    if(onnxruntime_USE_TELEMETRY AND NOT WIN32 AND NOT APPLE AND NOT onnxruntime_USE_VCPKG AND NOT onnxruntime_BUILD_SHARED_LIB)
+      # FetchContent static non-Apple telemetry ships mat plus bundled sqlite3/zlib archives in this
+      # package, but mat still links system libcurl and pthreads; the consumer must re-find them.
+      string(APPEND PROJECT_CONFIG_CONTENT
+        "find_dependency(CURL)\n\
+        find_dependency(Threads)\n\
+        ")
+    endif()
   endif()
 
   string(APPEND PROJECT_CONFIG_CONTENT

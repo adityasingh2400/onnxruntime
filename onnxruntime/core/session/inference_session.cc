@@ -8,6 +8,7 @@
 #include <sstream>
 #include <list>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <queue>
 #include <iomanip>
@@ -23,6 +24,7 @@
 #include "core/framework/bfc_arena.h"
 #include "core/framework/error_code_helper.h"
 #include "core/framework/device_stream_collection.h"
+#include "core/framework/ep_context_utils.h"
 #include "core/framework/execution_frame.h"
 #include "core/framework/feeds_fetches_manager.h"
 #include "core/framework/graph_partitioner.h"
@@ -65,6 +67,7 @@
 #endif
 #include "core/providers/cpu/controlflow/utils.h"
 #include "core/providers/cpu/cpu_execution_provider.h"
+#include "core/session/abi_devices.h"
 #ifdef USE_DML  // TODO: This is necessary for the workaround in TransformGraph
 #include "core/providers/dml/DmlExecutionProvider/src/DmlGraphFusionTransformer.h"
 #include "core/providers/dml/DmlExecutionProvider/src/DmlRuntimeGraphFusionTransformer.h"
@@ -76,6 +79,7 @@
 #include "core/session/environment.h"
 #include "core/session/IOBinding.h"
 #include "core/session/inference_session_utils.h"
+#include "core/session/onnxruntime_ep_device_ep_metadata_keys.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "core/session/onnxruntime_run_options_config_keys.h"
 #include "core/session/user_logging_sink.h"
@@ -125,6 +129,21 @@ int ParseSpinDurationUs(std::string_view str, const char* config_key,
   }
   return spin_us;
 }
+
+#if !defined(ORT_MINIMAL_BUILD)
+// Returns the virtual model path derived from the
+// kOrtSessionOptionsModelExternalInitializersFileFolderPath config option, or an empty
+// PathString when the option is not set. When set, external initializers are resolved
+// relative to this folder, overriding the model's own directory.
+PathString GetExternalInitializersFolderModelPath(const ConfigOptions& config_options) {
+  const std::string external_data_folder_path = config_options.GetConfigOrDefault(
+      kOrtSessionOptionsModelExternalInitializersFileFolderPath, "");
+  if (external_data_folder_path.empty()) {
+    return PathString{};
+  }
+  return ToPathString(external_data_folder_path + "/virtual_model.onnx");
+}
+#endif  // !defined(ORT_MINIMAL_BUILD)
 
 // Parse a spin backoff max config value (exponential-backoff cap). Defaults to
 // 1 (no backoff, one SpinPause() per iteration). Values >= 2 enable backoff.
@@ -225,11 +244,17 @@ static bool AreAllComputeNodesAssignedToEpOrCpu(const Graph& graph, ProviderType
     }
   }
 
-  // Require at least one node on the target EP, and no Memcpy nodes.
-  // We allow CPU EPs to show up in the EP list as long as there is no Memcpy
-  // involved as shape subgraphs will be forced onto CPU and these will not have
-  // Memcpy nodes involved.
-  return has_node_on_provider && !HasMemcpyNodes(graph);
+  // Allow graph capture when there are no Memcpy nodes and either:
+  //   (a) at least one node is assigned to the target EP, or
+  //   (b) the graph has no nodes at all.
+  // Case (b) covers models that are fully consumed by the EP (e.g. runtime graph
+  // fusion) or trivially fold away to an empty graph (e.g. a lone Constant node,
+  // as used for allocator-initialization sessions). Such graphs have nothing that
+  // violates the "all compute on the EP or CPU" requirement, so they must not be
+  // rejected merely because no node remains assigned to the EP.
+  // CPU EPs are allowed to show up as long as there is no Memcpy involved, since
+  // shape subgraphs are forced onto CPU and do not introduce Memcpy nodes.
+  return (has_node_on_provider || graph.NumberOfNodes() == 0) && !HasMemcpyNodes(graph);
 }
 
 static bool AreAllNodesInMainGraphAssignedToOneEp(const Graph& graph, ProviderType provider) {
@@ -298,6 +323,38 @@ Status GetMinimalBuildOptimizationHandling(
 };
 
 #endif  // !defined(ORT_MINIMAL_BUILD)
+
+// Maps an OrtHardwareDeviceType (from the V2 OrtEpDevice path) to a string
+// matching the EpDeviceUsage telemetry schema.
+const char* HardwareDeviceTypeToString(OrtHardwareDeviceType type) {
+  switch (type) {
+    case OrtHardwareDeviceType_CPU:
+      return "CPU";
+    case OrtHardwareDeviceType_GPU:
+      return "GPU";
+    case OrtHardwareDeviceType_NPU:
+      return "NPU";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+// Maps a legacy OrtDevice::DeviceType (used by EPs that did not come through the V2
+// OrtEpDevice path) to a string matching the EpDeviceUsage telemetry schema.
+const char* OrtDeviceTypeToString(OrtDevice::DeviceType type) {
+  switch (type) {
+    case OrtDevice::CPU:
+      return "CPU";
+    case OrtDevice::GPU:
+      return "GPU";
+    case OrtDevice::NPU:
+      return "NPU";
+    case OrtDevice::FPGA:
+      return "FPGA";
+    default:
+      return "UNKNOWN";
+  }
+}
 
 }  // namespace
 
@@ -826,10 +883,20 @@ InferenceSession::~InferenceSession() {
   ORT_TRY {
     std::lock_guard<std::mutex> telemetry_lock(telemetry_mutex_);
     if (telemetry_.total_runs_since_last_ > 0) {
-      Env::Default().GetTelemetryProvider().LogRuntimePerf(session_id_,
-                                                           telemetry_.total_runs_since_last_,
-                                                           telemetry_.total_run_duration_since_last_,
-                                                           telemetry_.duration_per_batch_size_);
+      const auto& telemetry_provider = Env::Default().GetTelemetryProvider();
+      telemetry_provider.LogRuntimePerf(session_id_,
+                                        telemetry_.total_runs_since_last_,
+                                        telemetry_.total_run_duration_since_last_,
+                                        telemetry_.duration_per_batch_size_);
+      // Also flush a final EpDeviceUsage per (EP, device) to capture any runs
+      // that occurred between the last heartbeat and session destruction.
+      for (const auto& ep_info : telemetry_.ep_device_info_) {
+        telemetry_provider.LogEpDeviceUsage(
+            session_id_, ep_info.ep_type, ep_info.hardware_device_type,
+            ep_info.vendor_id, ep_info.device_id, ep_info.vendor, ep_info.ep_vendor,
+            ep_info.ep_version, ep_info.assigned_node_count,
+            telemetry_.total_runs_since_last_, telemetry_.total_run_duration_since_last_);
+      }
     }
   }
   ORT_CATCH(const std::exception& e) {
@@ -1126,7 +1193,7 @@ common::Status InferenceSession::LoadWithLoader(std::function<common::Status(std
 
 common::Status InferenceSession::LoadOnnxModel(const PathString& model_uri) {
   model_location_ = model_uri;
-  auto loader = [this](std::shared_ptr<onnxruntime::Model>& model) {
+  auto loader = [this, model_uri](std::shared_ptr<onnxruntime::Model>& model) {
 #ifdef ENABLE_LANGUAGE_INTEROP_OPS
     LoadInterOp(model_location_, interop_domains_, [&](const char* msg) { LOGS(*session_logger_, WARNING) << msg; });
     InlinedVector<OrtCustomOpDomain*> domain_ptrs;
@@ -1137,10 +1204,19 @@ common::Status InferenceSession::LoadOnnxModel(const PathString& model_uri) {
 
     const bool strict_shape_type_inference = session_options_.config_options.GetConfigOrDefault(
                                                  kOrtSessionOptionsConfigStrictShapeTypeInference, "0") == "1";
+    ModelOptions model_opts(true, strict_shape_type_inference, check_load_cancellation_fn_);
+
+    // When set, the external initializers folder overrides the model's own directory as the
+    // base for resolving external data. The model bytes are still read from model_uri.
+    PathString external_data_model_path = GetExternalInitializersFolderModelPath(session_options_.config_options);
+    if (!external_data_model_path.empty()) {
+      model_location_ = external_data_model_path;
+      return onnxruntime::Model::Load(model_uri, model_location_, model,
+                                      HasLocalSchema() ? &custom_schema_registries_ : nullptr,
+                                      *session_logger_, model_opts);
+    }
     return onnxruntime::Model::Load(model_location_, model, HasLocalSchema() ? &custom_schema_registries_ : nullptr,
-                                    *session_logger_,
-                                    ModelOptions(true, strict_shape_type_inference,
-                                                 check_load_cancellation_fn_));
+                                    *session_logger_, model_opts);
   };
 
   common::Status st = LoadWithLoader(loader, "model_loading_uri");
@@ -1225,10 +1301,9 @@ common::Status InferenceSession::Load(const void* model_data, int model_data_len
     const bool strict_shape_type_inference = session_options_.config_options.GetConfigOrDefault(
                                                  kOrtSessionOptionsConfigStrictShapeTypeInference, "0") == "1";
 
-    std::string external_data_folder_path = session_options_.config_options.GetConfigOrDefault(
-        kOrtSessionOptionsModelExternalInitializersFileFolderPath, "");
-    if (!external_data_folder_path.empty() && model_location_.empty()) {
-      model_location_ = ToPathString(external_data_folder_path + "/virtual_model.onnx");
+    PathString external_data_model_path = GetExternalInitializersFolderModelPath(session_options_.config_options);
+    if (!external_data_model_path.empty()) {
+      model_location_ = external_data_model_path;
     }
 
     return onnxruntime::Model::Load(std::move(model_proto), model_location_, model,
@@ -1263,10 +1338,9 @@ common::Status InferenceSession::LoadOnnxModel(ModelProto model_proto) {
     const bool strict_shape_type_inference = session_options_.config_options.GetConfigOrDefault(
                                                  kOrtSessionOptionsConfigStrictShapeTypeInference, "0") == "1";
 
-    std::string external_data_folder_path = session_options_.config_options.GetConfigOrDefault(
-        kOrtSessionOptionsModelExternalInitializersFileFolderPath, "");
-    if (!external_data_folder_path.empty() && model_location_.empty()) {
-      model_location_ = ToPathString(external_data_folder_path + "/virtual_model.onnx");
+    PathString external_data_model_path = GetExternalInitializersFolderModelPath(session_options_.config_options);
+    if (!external_data_model_path.empty()) {
+      model_location_ = external_data_model_path;
     }
 
     // This call will move model_proto to the constructed model instance
@@ -1309,10 +1383,9 @@ common::Status InferenceSession::Load(std::istream& model_istream, bool allow_re
                             strict_shape_type_inference,
                             check_load_cancellation_fn_);
 
-    std::string external_data_folder_path = session_options_.config_options.GetConfigOrDefault(
-        kOrtSessionOptionsModelExternalInitializersFileFolderPath, "");
-    if (!external_data_folder_path.empty() && model_location_.empty()) {
-      model_location_ = ToPathString(external_data_folder_path + "/virtual_model.onnx");
+    PathString external_data_model_path = GetExternalInitializersFolderModelPath(session_options_.config_options);
+    if (!external_data_model_path.empty()) {
+      model_location_ = external_data_model_path;
     }
 
     return onnxruntime::Model::Load(std::move(model_proto), model_location_, model,
@@ -1342,6 +1415,11 @@ common::Status InferenceSession::Load() {
                                                  kOrtSessionOptionsConfigStrictShapeTypeInference, "0") == "1";
     const bool allow_released_opsets_only = session_options_.config_options.GetConfigOrDefault(
                                                 kOrtSessionOptionsConfigStrictAllowReleasedOpsetsOnly, "1") == "1";
+
+    PathString external_data_model_path = GetExternalInitializersFolderModelPath(session_options_.config_options);
+    if (!external_data_model_path.empty()) {
+      model_location_ = external_data_model_path;
+    }
 
     // Pass on ownership of the parsed ModelProto to the Model instance (its job here is done by this stage)
     return Model::Load(std::move(this->model_proto_), model_location_, model,
@@ -1607,18 +1685,21 @@ common::Status InferenceSession::TransformGraph(onnxruntime::Graph& graph, bool 
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
   std::optional<LayeringIndex> layering_index_storage;
   const auto layering_config = session_options_.config_options.GetConfigOrDefault(kOrtSessionOptionsLayerAssignmentSettings, "");
-  if (!layering_config.empty()) {
-    ORT_RETURN_IF_ERROR_SESSIONID_(LayeringIndex::Create(graph, layering_config, {}, execution_providers_,
+  const auto name_based_config = session_options_.config_options.GetConfigOrDefault(kOrtSessionOptionsNameBasedLayerAssignment, "");
+  if (!layering_config.empty() || !name_based_config.empty()) {
+    ORT_RETURN_IF_ERROR_SESSIONID_(LayeringIndex::Create(graph, layering_config, name_based_config, {}, execution_providers_,
                                                          *session_logger_, layering_index_storage));
     if (layering_index_storage) {
       layering_index = &layering_index_storage.value();
     }
   }
 #endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+  const epctx::ModelGenOptions& ep_context_gen_options = session_options_.GetEpContextGenerationOptions();
+
   // Do partitioning based on execution providers' capabilities.
   ORT_RETURN_IF_ERROR_SESSIONID_(partitioner.Partition(graph, session_state_->GetMutableFuncMgr(), transform_layout_fn,
                                                        session_options_.config_options, *session_logger_, layering_index,
-                                                       mode, session_options_.GetEpContextGenerationOptions(), debug_graph_fn));
+                                                       mode, ep_context_gen_options, debug_graph_fn));
 
 #if !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
   if (layering_index) {
@@ -1629,6 +1710,44 @@ common::Status InferenceSession::TransformGraph(onnxruntime::Graph& graph, bool 
     layering_index_storage.reset();
   }
 #endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
+
+  // Decide whether we need to emit the plain optimized (non-EPContext) output model for a compile-only
+  // session that compiled no nodes (the kGenerateModel case, e.g. a non-compiling EP such as WebGPU;
+  // Partition() serialized only the EPContext form). If so, honor action_if_no_compiled_nodes: the compile
+  // API uses kReturnError or kGenerateModel (kDontGenerateModel never reaches a compile-only session).
+  //
+  // The error is returned regardless of level. For kGenerateModel the serialization point is chosen by the
+  // requested optimization level so the output matches what a plain (non-compile) session would produce:
+  //   - level < Level2 (includes the Compile API's Default): serialize here, before the Level2+ loop and the
+  //     InsertCast/Memcpy transformers below - a BASIC snapshot identical to the graph at the partition
+  //     boundary (no Cast, no Memcpy nodes), unchanged from prior behavior.
+  //   - level >= Level2 (explicitly requested): serialize after the loop and Memcpy insertion below, so the
+  //     emitted model captures the Level2-Level4 fusions (and the device-placement copy nodes).
+  //
+  // In either case we intentionally do not return early for a compile-only session, so that the disable_cpu_ep_fallback
+  // behavior is unchanged. There are two such non-early-return points:
+  //   - Here in TransformGraph (the level < Level2 case, where the output model is already serialized): the
+  //     InsertCast/Memcpy transformers below are inserted unconditionally, independent of the optimization level, so we
+  //     must let them run to keep the transformed graph identical to prior behavior.
+  //   - In Initialize() overall: the disable_cpu_ep_fallback check there runs on that fully transformed graph
+  //     (including the Cast/Memcpy nodes). Returning early would change what that check sees and could let a
+  //     compile-only session with CPU-assigned nodes slip through, which we intentionally want to fail.
+  const bool emit_plain_compile_only_model =
+      session_options_.config_options.GetConfigOrDefault(kOrtSessionOptionCompileOnly, "0") == "1" &&
+      ep_context_gen_options.enable && !partitioner.AnyEpContextNodesProduced();
+  if (emit_plain_compile_only_model) {
+    using ActionIfNoCompiledNodes = epctx::ModelGenOptions::ActionIfNoCompiledNodes;
+    if (ep_context_gen_options.action_if_no_compiled_nodes == ActionIfNoCompiledNodes::kReturnError) {
+      ORT_RETURN_IF_ERROR_SESSIONID_(
+          ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
+                          "Unable to compile any nodes. Check that the session EPs support compilation "
+                          "and can execute at least one subgraph in the model."));
+    }
+    if (session_options_.graph_optimization_level < TransformerLevel::Level2) {
+      ORT_RETURN_IF_ERROR_SESSIONID_(
+          epctx::BuildAndSaveOptimizedModel(*model_, ep_context_gen_options, *session_logger_));
+    }
+  }
 
   // Get graph optimizations loop level from session config, if not present, set to default value of 1 as per
   // the definition of kOrtSessionOptionsGraphOptimizationsLoopLevel.
@@ -1678,7 +1797,7 @@ common::Status InferenceSession::TransformGraph(onnxruntime::Graph& graph, bool 
         cpu_regs = kernel_regs[kernel_regs.size() - 1];
       }
 
-      InsertCastTransformer insert_cast_transformer{"CastFloat16Transformer", cpu_regs};
+      InsertCastTransformer insert_cast_transformer{"CastFloat16Transformer", cpu_regs, on_partition_assignment_fn};
       ORT_RETURN_IF_ERROR_SESSIONID_(
           apply_transformer_once(insert_cast_transformer, *session_logger_, graph,
                                  ((graph_optimizations_loop_level > 1) ? &is_graph_modified : nullptr)));
@@ -1720,6 +1839,17 @@ common::Status InferenceSession::TransformGraph(onnxruntime::Graph& graph, bool 
     ORT_RETURN_IF_ERROR_SESSIONID_(apply_transformer_once(mem_transformer, *session_logger_, graph));
   }
 #endif
+
+  // Second serialization point for the plain optimized (non-EPContext) output model. Reached only for an
+  // explicitly requested level >= Level2 (level < Level2 was already serialized before the loop above). This runs
+  // after all graph transforms.
+  // action_if_no_compiled_nodes was already handled before the loop (kReturnError returned there), so only
+  // kGenerateModel reaches here.
+  if (emit_plain_compile_only_model &&
+      session_options_.graph_optimization_level >= TransformerLevel::Level2) {
+    ORT_RETURN_IF_ERROR_SESSIONID_(
+        epctx::BuildAndSaveOptimizedModel(*model_, ep_context_gen_options, *session_logger_));
+  }
 
   return Status::OK();
 }
@@ -2649,6 +2779,19 @@ common::Status InferenceSession::Initialize() {
 #endif  // !defined(ORT_MINIMAL_BUILD) || defined(ORT_EXTENDED_MINIMAL_BUILD)
     }
 
+    // Compile-only: a compile-only session never runs inference, so skip session-state finalization (kernel creation,
+    // PrePack, initializer upload, memory planning) and early return here.
+    //
+    // Returning here also bypasses the model-save block below, because a compile-only session does not produce its
+    // output via optimized_model_filepath. We still log the session-creation telemetry and record the
+    // end-of-initialization bookkeeping that the normal path emits, so neither is lost by returning early.
+    if (session_options_.config_options.GetConfigOrDefault(kOrtSessionOptionCompileOnly, "0") == "1") {
+      LOGS(*session_logger_, INFO)
+          << "Compile-only session: skipping session-state finalization. The session is not runnable.";
+      LogSessionCreationTelemetry(graph, model_weight_type, model_graph_hash, model_weight_hash);
+      return RecordSessionCreationEndTelemetry(tp, status);
+    }
+
     ORT_RETURN_IF_ERROR_SESSIONID_(
         session_state_->FinalizeSessionState(model_location_, kernel_registry_manager_,
                                              // need to keep the initializers if saving the optimized model
@@ -2719,13 +2862,7 @@ common::Status InferenceSession::Initialize() {
     session_state_->PruneRemovableAttributes();
 
     // and log telemetry
-    std::filesystem::path model_path = graph.ModelPath();
-    std::string model_file_name = PathToUTF8String(model_path.filename().native());
-    bool model_has_fp16_inputs = ModelHasFP16Inputs(graph);
-    env.GetTelemetryProvider().LogSessionCreation(
-        session_id_, model_->IrVersion(), model_->ProducerName(), model_->ProducerVersion(), model_->Domain(),
-        graph.DomainToVersionMap(), model_file_name, graph.Name(), model_weight_type, model_graph_hash, model_weight_hash,
-        model_->MetaData(), telemetry_.event_name_, execution_providers_.GetIds(), model_has_fp16_inputs, false);
+    LogSessionCreationTelemetry(graph, model_weight_type, model_graph_hash, model_weight_hash);
 
     LOGS(*session_logger_, INFO) << "Session successfully initialized.";
   }
@@ -2753,26 +2890,7 @@ common::Status InferenceSession::Initialize() {
     LOGS(*session_logger_, ERROR) << status.ErrorMessage();
   }
 
-  if (session_profiler_.IsEnabled()) {
-    session_profiler_.EndTimeAndRecordEvent(profiling::SESSION_EVENT, "session_initialization", tp);
-  }
-
-  if (status.IsOK()) {
-    for (auto& xp : execution_providers_) {
-      auto end_status = xp->OnSessionInitializationEnd();
-      if (status.IsOK()) {
-        status = end_status;
-      }
-    }
-  }
-
-  // Log session creation end telemetry
-  {
-    const Env& init_env = Env::Default();
-    init_env.GetTelemetryProvider().LogSessionCreationEnd(session_id_, status);
-  }
-
-  return status;
+  return RecordSessionCreationEndTelemetry(tp, status);
 }
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma warning(pop)
@@ -3205,7 +3323,10 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
                                  << " with graph annotation id: " << graph_annotation_id;
     // log evaluation start to trace logging provider
     env.GetTelemetryProvider().LogEvaluationStart(session_id_);
-    ORT_RETURN_IF_ERROR_SESSIONID_(cached_execution_provider_for_graph_replay_.ReplayGraph(graph_annotation_id));
+    bool sync_graph_replay = run_options.config_options.GetConfigOrDefault(
+                                 kOrtRunOptionsConfigDisableSynchronizeExecutionProviders, "0") == "0";
+    ORT_RETURN_IF_ERROR_SESSIONID_(cached_execution_provider_for_graph_replay_.ReplayGraph(graph_annotation_id,
+                                                                                           sync_graph_replay));
   } else {
     InlinedVector<IExecutionProvider*> exec_providers_to_stop;
     exec_providers_to_stop.reserve(execution_providers_.NumProviders());
@@ -3381,6 +3502,18 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
         env.GetTelemetryProvider().LogRuntimePerf(session_id_, telemetry_.total_runs_since_last_,
                                                   telemetry_.total_run_duration_since_last_,
                                                   telemetry_.duration_per_batch_size_);
+
+        // Emit one EpDeviceUsage event per (EP, hardware device) tuple so
+        // downstream consumers can attribute usage to a specific EP+device combo
+        // without joining back to SessionCreation (which may fall outside the
+        // telemetry pipeline's lookback window for long-lived sessions).
+        for (const auto& ep_info : telemetry_.ep_device_info_) {
+          env.GetTelemetryProvider().LogEpDeviceUsage(
+              session_id_, ep_info.ep_type, ep_info.hardware_device_type,
+              ep_info.vendor_id, ep_info.device_id, ep_info.vendor, ep_info.ep_vendor,
+              ep_info.ep_version, ep_info.assigned_node_count,
+              telemetry_.total_runs_since_last_, telemetry_.total_run_duration_since_last_);
+        }
         // reset counters
         telemetry_.time_sent_last_ = std::chrono::high_resolution_clock::now();
         telemetry_.total_runs_since_last_ = 0;
@@ -3392,6 +3525,10 @@ Status InferenceSession::RunImpl(const RunOptions& run_options,
                                                      Telemetry::kRuntimePerfMaxInterval);
       }
     }
+  } else {
+    // Log runtime error with EP versions
+    env.GetTelemetryProvider().LogRuntimeInferenceError(session_id_, retval, telemetry_.ep_versions_summary_,
+                                                        telemetry_.ep_device_types_summary_);
   }
 
   // log evaluation stop to trace logging provider
@@ -3820,6 +3957,18 @@ common::Status InferenceSession::Run(IOBinding& io_binding) {
   return Run(run_options, io_binding);
 }
 
+common::Status InferenceSession::ReleaseCapturedGraph(int graph_annotation_id) {
+  // Acquire session_mutex_ only when concurrent run is not supported, matching the
+  // locking pattern in Run(). For concurrent EPs the mutex is not held by Run(),
+  // so acquiring it here would not synchronize with in-flight runs; those EPs are
+  // responsible for their own thread safety in ReleaseCapturedGraph.
+  std::optional<std::lock_guard<std::mutex>> lock;
+  if (!is_concurrent_run_supported_) {
+    lock.emplace(session_mutex_);
+  }
+  return cached_execution_provider_for_graph_replay_.ReleaseCapturedGraph(graph_annotation_id);
+}
+
 template <typename T>
 void InferenceSession::StartProfiling(const std::basic_string<T>& file_prefix) {
   std::basic_ostringstream<T> ss;
@@ -3993,6 +4142,159 @@ void InferenceSession::ShrinkMemoryArenas(gsl::span<const AllocatorPtr> arenas_t
   }
 }
 
+void InferenceSession::PopulateEpDeviceInfo(const onnxruntime::Graph& graph) {
+  telemetry_.ep_device_info_.clear();
+  telemetry_.ep_device_types_summary_.clear();
+  telemetry_.ep_device_vendor_ids_summary_.clear();
+  telemetry_.ep_versions_summary_.clear();
+
+  // First, count nodes assigned to each EP type after graph partitioning.
+  // The graph node only carries the EP type string, so when a single EP targets
+  // multiple devices (e.g. QNN targeting both NPU and GPU on the same SoC) we
+  // cannot disambiguate node-to-device assignment here — every device row for the
+  // same EP type will carry the same total count. Downstream aggregation should
+  // use MAX (not SUM) across device rows to avoid double counting.
+  std::unordered_map<std::string, int> nodes_per_ep;
+  for (const auto& node : graph.Nodes()) {
+    const auto& ep = node.GetExecutionProviderType();
+    if (!ep.empty()) {
+      nodes_per_ep[ep]++;
+    }
+  }
+
+  // Then iterate registered EPs and emit one entry per (EP, OrtEpDevice) tuple,
+  // falling back to OrtDevice for legacy EPs that were not created via the V2
+  // OrtEpDevice path.
+  for (const auto& provider : execution_providers_) {
+    if (!provider) {
+      continue;
+    }
+
+    const std::string& ep_type = provider->Type();
+    const int assigned_nodes = nodes_per_ep.count(ep_type) ? nodes_per_ep[ep_type] : 0;
+    const auto& ep_devices = provider->GetEpDevices();
+
+    if (!ep_devices.empty()) {
+      // V2 path: full hardware metadata available via OrtEpDevice / OrtHardwareDevice.
+      for (const OrtEpDevice* ep_device : ep_devices) {
+        if (!ep_device) {
+          continue;
+        }
+
+        Telemetry::EpDeviceInfo entry;
+        entry.ep_type = ep_type;
+        entry.ep_vendor = ep_device->ep_vendor;
+        auto it = ep_device->ep_metadata.Entries().find(kOrtEpDevice_EpMetadataKey_Version);
+        if (it != ep_device->ep_metadata.Entries().end()) {
+          entry.ep_version = it->second;
+        }
+        if (ep_device->device != nullptr) {
+          entry.hardware_device_type = HardwareDeviceTypeToString(ep_device->device->type);
+          entry.vendor_id = ep_device->device->vendor_id;
+          entry.device_id = ep_device->device->device_id;
+          entry.vendor = ep_device->device->vendor;
+        } else {
+          entry.hardware_device_type = "UNKNOWN";
+        }
+        entry.assigned_node_count = assigned_nodes;
+        telemetry_.ep_device_info_.push_back(std::move(entry));
+      }
+    } else {
+      // Legacy path: only OrtDevice is available. PCI vendor/device IDs and
+      // vendor name are not populated for legacy EPs — downstream consumers
+      // see vendor_id from OrtDevice (which matches PCI for known EPs) and
+      // empty vendor / device_id of 0.
+      const OrtDevice& device = provider->GetDevice();
+      Telemetry::EpDeviceInfo entry;
+      entry.ep_type = ep_type;
+      entry.hardware_device_type = OrtDeviceTypeToString(device.Type());
+      entry.vendor_id = device.Vendor();
+      entry.device_id = 0;
+      entry.vendor = std::string();
+      entry.ep_vendor = std::string();
+      entry.assigned_node_count = assigned_nodes;
+      telemetry_.ep_device_info_.push_back(std::move(entry));
+    }
+  }
+
+  // Build the comma-separated summaries used to enrich SessionCreation. Order
+  // matches execution_providers_.GetIds() iteration order so consumers can join
+  // by position against the existing executionProviderIds field.
+  std::ostringstream types_oss;
+  std::ostringstream vendor_ids_oss;
+  std::ostringstream versions_oss;
+  bool first = true;
+  for (const auto& entry : telemetry_.ep_device_info_) {
+    if (!first) {
+      types_oss << ',';
+      vendor_ids_oss << ',';
+      versions_oss << ',';
+    }
+    first = false;
+    types_oss << entry.hardware_device_type;
+    // Format vendor IDs as hex for readability (PCI IDs are conventionally hex).
+    vendor_ids_oss << "0x" << std::hex << std::uppercase << std::setw(4)
+                   << std::setfill('0') << entry.vendor_id
+                   << std::dec << std::nouppercase << std::setfill(' ');
+    versions_oss << entry.ep_type << ':' << entry.ep_version;
+  }
+  telemetry_.ep_device_types_summary_ = types_oss.str();
+  telemetry_.ep_device_vendor_ids_summary_ = vendor_ids_oss.str();
+  telemetry_.ep_versions_summary_ = versions_oss.str();
+}
+
+void InferenceSession::LogSessionCreationTelemetry(const onnxruntime::Graph& graph,
+                                                   const std::string& model_weight_type,
+                                                   const std::string& model_graph_hash,
+                                                   const std::string& model_weight_hash) {
+  const Env& env = Env::Default();
+  std::filesystem::path model_path = graph.ModelPath();
+  std::string model_file_name = PathToUTF8String(model_path.filename().native());
+  bool model_has_fp16_inputs = ModelHasFP16Inputs(graph);
+
+  // Populate per-(EP, hardware-device) telemetry data captured once at session
+  // initialization. The graph partitioning is complete at this point, so we can
+  // count how many nodes each EP is assigned. This populates telemetry_.ep_device_info_
+  // and the comma-separated summary strings used to enrich SessionCreation.
+  PopulateEpDeviceInfo(graph);
+
+  env.GetTelemetryProvider().LogSessionCreation(
+      session_id_, model_->IrVersion(), model_->ProducerName(), model_->ProducerVersion(), model_->Domain(),
+      graph.DomainToVersionMap(), model_file_name, graph.Name(), model_weight_type, model_graph_hash, model_weight_hash,
+      model_->MetaData(), telemetry_.event_name_, execution_providers_.GetIds(),
+      telemetry_.ep_device_types_summary_, telemetry_.ep_device_vendor_ids_summary_,
+      telemetry_.ep_versions_summary_,
+      model_has_fp16_inputs, false);
+
+  // Emit one initial EpDeviceUsage event per (EP, device) pair with run counts of 0.
+  // Ensures we capture EP/device topology even for sessions that end before the
+  // first RuntimePerf heartbeat (2s after the first Run()).
+  for (const auto& ep_info : telemetry_.ep_device_info_) {
+    env.GetTelemetryProvider().LogEpDeviceUsage(
+        session_id_, ep_info.ep_type, ep_info.hardware_device_type,
+        ep_info.vendor_id, ep_info.device_id, ep_info.vendor, ep_info.ep_vendor,
+        ep_info.ep_version, ep_info.assigned_node_count, 0, 0);
+  }
+}
+
+common::Status InferenceSession::RecordSessionCreationEndTelemetry(const TimePoint& tp, common::Status status) {
+  if (session_profiler_.IsEnabled()) {
+    session_profiler_.EndTimeAndRecordEvent(profiling::SESSION_EVENT, "session_initialization", tp);
+  }
+
+  if (status.IsOK()) {
+    for (auto& xp : execution_providers_) {
+      auto end_status = xp->OnSessionInitializationEnd();
+      if (status.IsOK()) {
+        status = end_status;
+      }
+    }
+  }
+
+  Env::Default().GetTelemetryProvider().LogSessionCreationEnd(session_id_, status);
+  return status;
+}
+
 #if !defined(ORT_MINIMAL_BUILD)
 // assumes model has already been loaded before
 common::Status InferenceSession::DoPostLoadProcessing(onnxruntime::Model& model) {
@@ -4132,7 +4434,8 @@ common::Status InferenceSession::AddPredefinedTransformers(
         transformers_to_register = [&]() {
           return optimizer_utils::GenerateTransformers(level, session_options_, cpu_ep, logger,
                                                        optimizers_to_disable_,
-                                                       GetIntraOpThreadPoolToUse());
+                                                       GetIntraOpThreadPoolToUse(),
+                                                       &execution_providers_);
         };
       }
     } else {
@@ -4146,7 +4449,8 @@ common::Status InferenceSession::AddPredefinedTransformers(
           if (use_full_build_optimizations) {
             return optimizer_utils::GenerateTransformers(level, session_options_, cpu_ep, logger,
                                                          optimizers_to_disable_,
-                                                         GetIntraOpThreadPoolToUse());
+                                                         GetIntraOpThreadPoolToUse(),
+                                                         &execution_providers_);
           } else {
             const auto sat_context =
                 minimal_build_optimization_handling ==
@@ -4235,7 +4539,10 @@ void InferenceSession::LogAllSessions() {
       env.GetTelemetryProvider().LogSessionCreation(
           session->session_id_, model->IrVersion(), model->ProducerName(), model->ProducerVersion(), model->Domain(),
           graph.DomainToVersionMap(), model_file_name, graph.Name(), model_weight_type, model_graph_hash, model_weight_hash,
-          model->MetaData(), session->telemetry_.event_name_, session->execution_providers_.GetIds(), model_has_fp16_inputs, true);
+          model->MetaData(), session->telemetry_.event_name_, session->execution_providers_.GetIds(),
+          session->telemetry_.ep_device_types_summary_, session->telemetry_.ep_device_vendor_ids_summary_,
+          session->telemetry_.ep_versions_summary_,
+          model_has_fp16_inputs, true);
     }
 
     InferenceSession::TraceSessionOptions(session->session_options_, true, *session->session_logger_);

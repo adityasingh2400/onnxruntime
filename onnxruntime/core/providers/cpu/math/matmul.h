@@ -103,7 +103,43 @@ class MatMul<float> final : public OpKernel {
   // sbgemm kernel is implemented as 8x8 blocks with weights pre-packed to 4 blocks of 4x2
   // so a minimum of 32 elements is defined to outweigh the additional prepacking overhead
   const size_t kFastMathModeKernelsizeThreshold = 32;
+
+  bool CanUseFastMathModeSBGemm(size_t n, size_t k) const {
+    return use_fastmath_mode_ &&
+           (trans_a_attr_ == 0) &&
+           (trans_b_attr_ == 0) &&
+           ((n * k) >= kFastMathModeKernelsizeThreshold);
+  }
+
+  bool CanPackBForFastMathModeSBGemm(const TensorShape& b_shape) const {
+    return b_shape.NumDimensions() == 2 &&
+           CanUseFastMathModeSBGemm(static_cast<size_t>(b_shape[1]), static_cast<size_t>(b_shape[0]));
+  }
 #endif
+};
+
+template <>
+class MatMul<MLFloat16> final : public OpKernel {
+ public:
+  MatMul(const OpKernelInfo& info) : OpKernel(info) {
+    SetupMlasBackendKernelSelectorFromConfigOptions(mlas_backend_kernel_selector_config_, info.GetConfigOptions());
+  }
+
+  Status PrePack(const Tensor& tensor, int input_idx, AllocatorPtr alloc,
+                 /*out*/ bool& is_packed,
+                 /*out*/ PrePackedWeights* prepacked_weights) override;
+
+  Status UseSharedPrePackedBuffers(std::vector<BufferUniquePtr>& prepacked_buffers,
+                                   gsl::span<const size_t> /*prepacked_buffer_sizes*/,
+                                   int input_idx,
+                                   /*out*/ bool& used_shared_buffers) override;
+
+  Status Compute(OpKernelContext* context) const override;
+
+ private:
+  TensorShape b_shape_;
+  IAllocatorUniquePtr<void> packed_b_;
+  MLAS_BACKEND_KERNEL_SELECTOR_CONFIG mlas_backend_kernel_selector_config_;
 };
 
 }  // namespace onnxruntime

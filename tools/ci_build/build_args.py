@@ -228,6 +228,12 @@ def add_testing_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip_winml_tests", action="store_true", help="Explicitly disable WinML related tests.")
     parser.add_argument("--skip_nodejs_tests", action="store_true", help="Explicitly disable Node.js binding tests.")
     parser.add_argument("--ctest_timeout", default="10800", help="Timeout provided to CTest --timeout (seconds).")
+    parser.add_argument(
+        "--test_parallel",
+        default=None,
+        type=int,
+        help="Max CTest parallel jobs. Defaults to --parallel. Optional value 0 uses num CPUs.",
+    )
     parser.add_argument("--enable_transformers_tool_test", action="store_true", help="Enable transformers tool test.")
     parser.add_argument("--build_micro_benchmarks", action="store_true", help="Build ONNXRuntime micro-benchmarks.")
     parser.add_argument("--code_coverage", action="store_true", help="Generate code coverage report (Android only).")
@@ -429,7 +435,6 @@ def add_windows_specific_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--msvc_toolset", help="MSVC toolset version (e.g., 14.11). Must be >=14.40")
     parser.add_argument("--windows_sdk_version", help="Windows SDK version (e.g., 10.0.19041.0).")
     parser.add_argument("--enable_msvc_static_runtime", action="store_true", help="Statically link MSVC runtimes.")
-    parser.add_argument("--use_telemetry", action="store_true", help="Enable telemetry (official builds only).")
     parser.add_argument("--caller_framework", type=str, help="Name of the framework calling ONNX Runtime.")
 
     # Cross-compilation targets hosted on Windows
@@ -646,10 +651,15 @@ def add_execution_provider_args(parser: argparse.ArgumentParser) -> None:
     cuda_group.add_argument("--enable_cuda_minimal_build", action="store_true", help="Enable CUDA minimal build.")
     cuda_group.add_argument(
         "--nvcc_threads",
-        nargs="?",
-        default=-1,  # -1 signifies auto-detect based on jobs/memory
+        default=4,
         type=int,
-        help="Max NVCC threads per parallel job (-1=auto).",
+        help="Max NVCC threads per parallel job (default is 4).",
+    )
+    cuda_group.add_argument(
+        "--flash_nvcc_threads",
+        default=-1,
+        type=int,
+        help="Max NVCC threads per parallel job for flash attention (default is same value of --nvcc_threads).",
     )
     # CUDA-specific profiling
     cuda_group.add_argument(
@@ -819,9 +829,9 @@ def add_execution_provider_args(parser: argparse.ArgumentParser) -> None:
     )
     webgpu_group.add_argument(
         "--wgsl_template",
-        choices=["static", "dynamic"],
-        default="static",  # By default, use static WGSL template generation
-        help="Specify the generator for WebGPU WGSL template generation.",
+        choices=["static"],
+        default="static",
+        help="Deprecated no-op. WGSL template generation is always static; kept for backward compatibility.",
     )
 
     # --- XNNPACK ---
@@ -857,6 +867,12 @@ def add_other_feature_args(parser: argparse.ArgumentParser) -> None:
         "--enable_generic_interface",
         action="store_true",
         help="Build ORT shared lib with compatible bridge for primary EPs (TRT, OV, QNN, VitisAI), excludes tests.",
+    )
+    # Telemetry arguments (cross-platform)
+    parser.add_argument(
+        "--use_telemetry",
+        action="store_true",
+        help="Enable telemetry (not supported for WebAssembly or external Windows builds).",
     )
 
 

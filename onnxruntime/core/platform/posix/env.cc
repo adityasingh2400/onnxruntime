@@ -16,6 +16,10 @@ limitations under the License.
 
 #include "core/platform/env.h"
 
+#ifdef USE_POSIX_TELEMETRY
+#include "core/platform/posix/telemetry.h"
+#endif
+
 #include <assert.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -277,7 +281,7 @@ class PosixEnv : public Env {
 
   std::vector<LogicalProcessors> GetDefaultThreadAffinities() const override {
     std::vector<LogicalProcessors> ret;
-#ifdef ORT_USE_CPUINFO
+#if defined(ORT_USE_CPUINFO) && defined(__linux__)
     if (cpuinfo_available_) {
       auto num_phys_cores = cpuinfo_get_cores_count();
       ret.reserve(num_phys_cores);
@@ -293,7 +297,7 @@ class PosixEnv : public Env {
         ret.push_back(std::move(th_aff));
       }
     }
-#endif
+#endif  // defined(ORT_USE_CPUINFO) && defined(__linux__)
     // Just the size of the thread-pool
     if (ret.empty()) {
       ret.resize(GetNumPhysicalCpuCores());
@@ -303,7 +307,26 @@ class PosixEnv : public Env {
 
   int GetL2CacheSize() const override {
 #ifdef _SC_LEVEL2_CACHE_SIZE
-    return static_cast<int>(sysconf(_SC_LEVEL2_CACHE_SIZE));
+    // Prefer sysconf where it is implemented (e.g. Linux/x86), so those
+    // platforms keep their existing, working values. glibc's aarch64 backend
+    // does not implement the cache-size queries, so sysconf(_SC_LEVEL2_CACHE_SIZE)
+    // returns 0 on Linux/aarch64, which silently disables cache-tiled kernels
+    // (e.g. CPU FlashAttention in MultiHeadAttention). Only when sysconf reports
+    // no L2 do we fall back to cpuinfo, which reads the sizes from sysfs
+    // cacheinfo and works across architectures.
+    const auto l2_cache_size = sysconf(_SC_LEVEL2_CACHE_SIZE);
+    if (l2_cache_size > 0) {
+      return narrow<int>(l2_cache_size);
+    }
+#ifdef ORT_USE_CPUINFO
+    if (cpuinfo_available_ && cpuinfo_get_l2_caches_count() > 0) {
+      const auto* l2_cache = cpuinfo_get_l2_cache(0);
+      if (l2_cache != nullptr && l2_cache->size > 0) {
+        return narrow<int>(l2_cache->size);
+      }
+    }
+#endif  // ORT_USE_CPUINFO
+    return narrow<int>(l2_cache_size);
 #else
     int value = 0;  // unknown
 #if (defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)) && defined(HW_L2CACHESIZE)
@@ -543,6 +566,19 @@ class PosixEnv : public Env {
     return Status::OK();
   }
 
+  common::Status GetWeaklyCanonicalPath(
+      const PathString& path,
+      PathString& canonical_path) const override {
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(std::filesystem::path{path}, ec);
+    if (ec) {
+      return common::Status(common::ONNXRUNTIME, common::FAIL,
+                            "Failed to get the weakly canonical path: " + path + " - " + ec.message());
+    }
+    canonical_path.assign(canonical.native());
+    return Status::OK();
+  }
+
   common::Status LoadDynamicLibrary(const PathString& library_filename, bool global_symbols, void** handle) const override {
     dlerror();  // clear any old error_str
     *handle = dlopen(library_filename.c_str(), RTLD_NOW | (global_symbols ? RTLD_GLOBAL : RTLD_LOCAL));
@@ -626,7 +662,11 @@ class PosixEnv : public Env {
   }
 
  private:
+#ifdef USE_POSIX_TELEMETRY
+  PosixTelemetry telemetry_provider_;
+#else
   Telemetry telemetry_provider_;
+#endif
 #ifdef ORT_USE_CPUINFO
   PosixEnv() {
     cpuinfo_available_ = cpuinfo_initialize();
@@ -642,6 +682,11 @@ class PosixEnv : public Env {
         std::cerr << "onnxruntime warning: cpuinfo_initialize failed. "
                      "May cause CPU EP performance degradation due to undetected CPU features.\n";
       }
+    }
+  }
+  ~PosixEnv() {
+    if (cpuinfo_available_) {
+      cpuinfo_deinitialize();
     }
   }
   bool cpuinfo_available_{false};

@@ -52,11 +52,15 @@ Do not modify directly.*
   * <a href="#com.microsoft.Irfft">com.microsoft.Irfft</a>
   * <a href="#com.microsoft.LinearAttention">com.microsoft.LinearAttention</a>
   * <a href="#com.microsoft.LongformerAttention">com.microsoft.LongformerAttention</a>
+  * <a href="#com.microsoft.MatMulBlockQuantizedFp4Weight">com.microsoft.MatMulBlockQuantizedFp4Weight</a>
+  * <a href="#com.microsoft.MatMulBlockQuantizedFp8Weight">com.microsoft.MatMulBlockQuantizedFp8Weight</a>
   * <a href="#com.microsoft.MatMulBnb4">com.microsoft.MatMulBnb4</a>
   * <a href="#com.microsoft.MatMulFpQ4">com.microsoft.MatMulFpQ4</a>
   * <a href="#com.microsoft.MatMulInteger16">com.microsoft.MatMulInteger16</a>
   * <a href="#com.microsoft.MatMulIntegerToFloat">com.microsoft.MatMulIntegerToFloat</a>
   * <a href="#com.microsoft.MatMulNBits">com.microsoft.MatMulNBits</a>
+  * <a href="#com.microsoft.MatMulNBitsMlp">com.microsoft.MatMulNBitsMlp</a>
+  * <a href="#com.microsoft.MatMulNBitsQkv">com.microsoft.MatMulNBitsQkv</a>
   * <a href="#com.microsoft.MaxpoolWithMask">com.microsoft.MaxpoolWithMask</a>
   * <a href="#com.microsoft.MoE">com.microsoft.MoE</a>
   * <a href="#com.microsoft.MulInteger">com.microsoft.MulInteger</a>
@@ -1673,7 +1677,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>(Optional) the source used to generate the engine/context cache file. Ort EP or native SDK tool chain</dd>
 </dl>
 
-#### Inputs (1 - &#8734;)
+#### Inputs (0 - &#8734;)
 
 <dl>
 <dt><tt>inputs</tt> (variadic, heterogeneous) : T</dt>
@@ -2108,7 +2112,8 @@ This version of the operator has been available since version 1 of the 'com.micr
     3. During the op execution, `data` and `indices` are first used to generate the quantized output. Then, `scales` and `zero_points` are used
        to dequantize the output.
     4. The `output` and `scales` have the same type. The `data` and `zero_points` have the same type.
-    5. For uint8 data, the `gather_axis` must be 0.
+    5. For uint8 data, the `gather_axis` must be 0. The supported `bits` values for uint8 data are 2, 4, and 8;
+       for `bits` < 8 the values are packed along the last dimension (low-order bits first).
 
 #### Version
 
@@ -2118,7 +2123,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 
 <dl>
 <dt><tt>bits</tt> : int</dt>
-<dd>Number of bits used for weight quantization. Must be either 4 or 8. </dd>
+<dd>Number of bits used for weight quantization. Must be 2, 4 or 8. </dd>
 <dt><tt>block_size</tt> : int</dt>
 <dd>(Optional) block size used for weight quantization. It needs to be a power of 2 and not smaller than 16.</dd>
 <dt><tt>gather_axis</tt> : int</dt>
@@ -2624,12 +2629,16 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>left_window_size for local attention (like Mistral). Default value is -1 meaning unused.</dd>
 <dt><tt>num_heads</tt> : int (required)</dt>
 <dd>Number of attention heads for q</dd>
+<dt><tt>qk_norm_epsilon</tt> : float</dt>
+<dd>Epsilon used by the per-head RMS norm applied to Q and K when q_norm_weight and k_norm_weight inputs are provided. Default value is 1e-6.</dd>
 <dt><tt>qk_output</tt> : int</dt>
 <dd>Output values of QK matrix multiplication before (1) or after (2) softmax normalization. Default value is 0 (don't output).</dd>
 <dt><tt>rotary_interleaved</tt> : int</dt>
 <dd>Rotate using interleaved pattern. Default value is 0 (False).</dd>
 <dt><tt>scale</tt> : float</dt>
 <dd>Custom scale will be used if specified. Default value is 1/sqrt(head_size)</dd>
+<dt><tt>sliding_window_cache</tt> : int</dt>
+<dd>Set to 1 when the past/present KV buffers are window-sized instead of holding the whole sequence. The op then keeps only the min(total_sequence_length, cache_capacity) most recent tokens, contiguously, using cache-relative indexing and evicting from the front as needed. Requires local_window_size > 0 and a cache capacity of at least local_window_size. Multi-token steps may use a temporary staging buffer, so the capacity need not cover the entire step. Default value is 0 (full-length cache).</dd>
 <dt><tt>smooth_softmax</tt> : int</dt>
 <dd>Use a smooth factor in softmax.</dd>
 <dt><tt>softcap</tt> : float</dt>
@@ -2638,7 +2647,7 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>Quantization type for V cache. One of 'NONE', 'PER_TENSOR', 'PER_CHANNEL'.</dd>
 </dl>
 
-#### Inputs (7 - 14)
+#### Inputs (7 - 16)
 
 <dl>
 <dt><tt>query</tt> : T</dt>
@@ -2669,16 +2678,20 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>Scale tensor for past_key.</dd>
 <dt><tt>v_scale</tt> (optional) : T_KV_SCALE</dt>
 <dd>Scale tensor for past_value.</dd>
+<dt><tt>q_norm_weight</tt> (optional) : T</dt>
+<dd>Optional 1D tensor of shape (head_size). When provided together with k_norm_weight, the kernel applies a per-head RMS normalization to Q (and K) before any rotary embedding. Used by Qwen3-style models that wrap their Q/K projections in a Reshape -> SimplifiedLayerNormalization -> Reshape stack; downstream graph fusion folds that pattern into this input. Currently honored by the CUDA and native WebGPU execution providers; JSEP WebGPU/JS and other EPs must reject the node when this input is set.</dd>
+<dt><tt>k_norm_weight</tt> (optional) : T</dt>
+<dd>Optional 1D tensor of shape (head_size). See q_norm_weight. Must be provided together with q_norm_weight.</dd>
 </dl>
 
-#### Outputs (3 - 4)
+#### Outputs (1 - 4)
 
 <dl>
 <dt><tt>output</tt> : T</dt>
 <dd>3D output tensor with shape (batch_size, sequence_length, hidden_size)</dd>
-<dt><tt>present_key</tt> : T_CACHE</dt>
+<dt><tt>present_key</tt> (optional) : T_CACHE</dt>
 <dd>present state key with support for format BNSH. When past_key uses same tensor as present_key(k-v buffer), it is of length max_sequence_length... otherwise of length past_sequence_length +kv_sequence_length.</dd>
-<dt><tt>present_value</tt> : T_CACHE</dt>
+<dt><tt>present_value</tt> (optional) : T_CACHE</dt>
 <dd>present state value with support for format BNSH. When past_value uses same tensor as present_value(k-v buffer), it is of length max_sequence_length... otherwise of length past_sequence_length +kv_sequence_length.</dd>
 <dt><tt>output_qk</tt> (optional) : T</dt>
 <dd>Values of QK matrix multiplication, either before or after softmax normalization</dd>
@@ -2897,6 +2910,129 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>Constrain input and output types to float tensors.</dd>
 <dt><tt>G</tt> : tensor(int32)</dt>
 <dd>Constrain to integer types</dd>
+</dl>
+
+
+### <a name="com.microsoft.MatMulBlockQuantizedFp4Weight"></a><a name="com.microsoft.matmulblockquantizedfp4weight">**com.microsoft.MatMulBlockQuantizedFp4Weight**</a>
+
+  Weight-only NVFP4 (E2M1) matrix multiplication.
+  
+  The weight tensor B is stored as packed NVFP4: two E2M1 values per byte (low nibble first).
+  The dequantized weight value is `e2m1(B) * weight_scale_2 * e4m3(weight_scale[n, k / block_size])`,
+  where `weight_scale` holds one E4M3 scale per `block_size` (default 16) consecutive K values and
+  `weight_scale_2` is a single global fp32 scale. The weight is dequantized to the activation type
+  (FP16/BF16) and multiplied with the FP16/BF16 activation. This path is architecture independent and
+  runs on Hopper (SM90) as well as Blackwell.
+  
+  The output columns `N` and the contraction dimension `K` are derived from the weight shape:
+  `N = B.shape[0]` and `K = 2 * B.shape[1]`. `K` must therefore be even.
+
+#### Version
+
+This version of the operator has been available since version 1 of the 'com.microsoft' operator set.
+
+#### Attributes
+
+<dl>
+<dt><tt>block_size</tt> : int</dt>
+<dd>Number of consecutive K values that share one E4M3 weight scale. Default 16.</dd>
+</dl>
+
+#### Inputs (4 - 6)
+
+<dl>
+<dt><tt>A</tt> : T</dt>
+<dd>Row-major FP16/BF16 activation of shape [..., K].</dd>
+<dt><tt>B</tt> : T1</dt>
+<dd>Packed NVFP4 weight of shape [N, K/2] stored as uint8 (two E2M1 values per byte, low nibble first).</dd>
+<dt><tt>weight_scale</tt> : T2</dt>
+<dd>Per-block E4M3 weight scales of shape [N, ceil(K / block_size)] stored as raw uint8 bytes.</dd>
+<dt><tt>weight_scale_2</tt> : T3</dt>
+<dd>Global fp32 weight scale (scalar).</dd>
+<dt><tt>input_scale</tt> (optional) : T3</dt>
+<dd>Optional global fp32 activation scale (scalar). Accepted for parity with quantized checkpoints; it is a no-op on the weight-only FP16/BF16 path and is reserved for the native NVFP4 path on Blackwell.</dd>
+<dt><tt>bias</tt> (optional) : T</dt>
+<dd>Optional bias of shape [N].</dd>
+</dl>
+
+#### Outputs
+
+<dl>
+<dt><tt>Y</tt> : T</dt>
+<dd>Output of shape [..., N] in the activation type.</dd>
+</dl>
+
+#### Type Constraints
+
+<dl>
+<dt><tt>T</tt> : tensor(float16), tensor(bfloat16)</dt>
+<dd>Constrain activation, bias and output to FP16 or BF16.</dd>
+<dt><tt>T1</tt> : tensor(uint8)</dt>
+<dd>Constrain packed NVFP4 weight to uint8.</dd>
+<dt><tt>T2</tt> : tensor(uint8)</dt>
+<dd>Constrain E4M3 weight scales to uint8.</dd>
+<dt><tt>T3</tt> : tensor(float)</dt>
+<dd>Constrain scalar scales to FP32.</dd>
+</dl>
+
+
+### <a name="com.microsoft.MatMulBlockQuantizedFp8Weight"></a><a name="com.microsoft.matmulblockquantizedfp8weight">**com.microsoft.MatMulBlockQuantizedFp8Weight**</a>
+
+  Weight-only block-scaled FP8 (E4M3) matrix multiplication.
+  
+  The weight tensor B is FP8 E4M3 of shape [N, K] with one FP32 scale per `block_size` consecutive
+  K values (`b_scale` of shape [N, ceil(K / block_size)]). The dequantized weight value is
+  `fp8_e4m3(B[n, k]) * b_scale[n, k / block_size]`. The weight is dequantized to the activation
+  type (FP16/BF16) and multiplied with the FP16/BF16 activation A. This path is architecture
+  independent and runs on any CUDA architecture (SM80+).
+  
+  When the optional `a_scale` (a single fp32 scalar) is provided, the activation A is statically
+  quantized to FP8 E4M3 and dequantized back (`a_deq = fp8_e4m3(A / a_scale) * a_scale`) before the
+  matmul, realizing W8A8 activation numerics. When `a_scale` is omitted the activation is kept at
+  full FP16/BF16 precision (weight-only W8A16).
+
+#### Version
+
+This version of the operator has been available since version 1 of the 'com.microsoft' operator set.
+
+#### Attributes
+
+<dl>
+<dt><tt>block_size</tt> : int</dt>
+<dd>Number of consecutive K values that share one weight scale. Default 128.</dd>
+</dl>
+
+#### Inputs (3 - 5)
+
+<dl>
+<dt><tt>A</tt> : T</dt>
+<dd>Row-major FP16/BF16 activation of shape [..., K].</dd>
+<dt><tt>B</tt> : T1</dt>
+<dd>Row-major FP8 E4M3 weight of shape [N, K].</dd>
+<dt><tt>b_scale</tt> : T2</dt>
+<dd>Per-block FP32 weight scales of shape [N, ceil(K / block_size)].</dd>
+<dt><tt>a_scale</tt> (optional) : T2</dt>
+<dd>Optional global fp32 activation scale (scalar). When present, A is statically quantized to FP8 E4M3 with this scale and dequantized back before the matmul (W8A8 numerics); when absent, A stays in full FP16/BF16 precision.</dd>
+<dt><tt>bias</tt> (optional) : T</dt>
+<dd>Optional bias of shape [N].</dd>
+</dl>
+
+#### Outputs
+
+<dl>
+<dt><tt>Y</tt> : T</dt>
+<dd>Output of shape [..., N] in the activation type.</dd>
+</dl>
+
+#### Type Constraints
+
+<dl>
+<dt><tt>T</tt> : tensor(float16), tensor(bfloat16)</dt>
+<dd>Constrain activation, bias and output to FP16 or BF16.</dd>
+<dt><tt>T1</tt> : tensor(float8e4m3fn)</dt>
+<dd>Constrain weight to FP8 E4M3.</dd>
+<dt><tt>T2</tt> : tensor(float)</dt>
+<dd>Constrain scales to FP32.</dd>
 </dl>
 
 
@@ -3146,9 +3282,11 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>accuracy_level</tt> : int</dt>
 <dd>The minimum accuracy level of input A, can be: 0(unset), 1(fp32), 2(fp16), 3(bf16), or 4(int8) (default unset). It is used to control how input A is quantized or downcast internally while doing computation, for example: 0 means input A will not be quantized or downcast while doing computation. 4 means input A can be quantized with the same block_size to int8 internally from type T1.</dd>
 <dt><tt>bits</tt> : int</dt>
-<dd>Bit-width used to quantize the weights (valid range: 2~8)</dd>
+<dd>Bit-width used to quantize the weights (supported values: 2, 4, 8)</dd>
 <dt><tt>block_size</tt> : int (required)</dt>
 <dd>Size of each quantization block along the K (input feature) dimension. Must be a power of two and ≥ 16 (e.g., 16, 32, 64, 128).</dd>
+<dt><tt>weight_prepacked</tt> : int</dt>
+<dd>If set, input B is already prepacked into an EP-specific layout and the EP skips runtime weight prepacking. 0 (default): not prepacked. 1: prepacked in the CUDA SM80 fpA_intB layout. 2: prepacked in the CUDA SM90 (Hopper) fpA_intB layout, consumed by the native SM90 kernel (requires a compute capability 9.0 device and block_size in {64, 128}).</dd>
 </dl>
 
 #### Inputs (3 - 6)
@@ -3186,6 +3324,196 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>Constrain quantized zero point types to uint8 or float tensors.</dd>
 <dt><tt>T4</tt> : tensor(int32)</dt>
 <dd>the index tensor.</dd>
+</dl>
+
+
+### <a name="com.microsoft.MatMulNBitsMlp"></a><a name="com.microsoft.matmulnbitsmlp">**com.microsoft.MatMulNBitsMlp**</a>
+
+  MatMulNBitsMlp fuses two MatMulNBits projections that share the same input and computes
+  
+      gate = MatMulNBits(A, gate_weight) + gate_bias
+      up = MatMulNBits(A, up_weight) + up_bias
+      Y = activation(gate) * up
+  
+  It can also optionally fuse SimplifiedLayerNormalization or SkipSimplifiedLayerNormalization before the
+  two projections:
+  
+    A_norm = SimplifiedLayerNormalization(A, norm_scale, epsilon)
+      gate = MatMulNBits(A_norm, gate_weight) + gate_bias
+      up = MatMulNBits(A_norm, up_weight) + up_bias
+      Y = activation(gate) * up
+  
+    A_norm = SkipSimplifiedLayerNormalization(A, skip, norm_scale, epsilon)
+      gate = MatMulNBits(A_norm, gate_weight) + gate_bias
+      up = MatMulNBits(A_norm, up_weight) + up_bias
+      Y = activation(gate) * up
+  
+  This operator is intended for decoder MLP patterns such as Qwen-style gate and up projections, but it remains
+  semantically valid for both prefill and decode because the output shape is the standard MatMul result shape
+  derived from the runtime shape of A and the shared attributes K and N.
+  
+  The operator contract includes a string attribute describing the fused gate activation.
+  
+  When fused from SkipSimplifiedLayerNormalization, the optional residual-sum output may also be materialized:
+  
+    A_norm, input_skip_bias_sum = SkipSimplifiedLayerNormalization(A, skip, norm_scale, epsilon)
+    gate = MatMulNBits(A_norm, gate_weight) + gate_bias
+    up = MatMulNBits(A_norm, up_weight) + up_bias
+    Y = activation(gate) * up
+
+#### Version
+
+This version of the operator has been available since version 1 of the 'com.microsoft' operator set.
+
+#### Attributes
+
+<dl>
+<dt><tt>K</tt> : int (required)</dt>
+<dd>Input feature dimension shared by both quantized weight matrices.</dd>
+<dt><tt>N</tt> : int (required)</dt>
+<dd>Output feature dimension shared by both quantized weight matrices.</dd>
+<dt><tt>accuracy_level</tt> : int</dt>
+<dd>The minimum accuracy level of input A. It follows the same semantics as MatMulNBits.</dd>
+<dt><tt>activation</tt> : string (required)</dt>
+<dd>Activation applied to the gate projection.</dd>
+<dt><tt>bits</tt> : int</dt>
+<dd>Bit-width used to quantize both weight matrices. Currently only bits=4 is supported by the WebGPU kernel.</dd>
+<dt><tt>block_size</tt> : int (required)</dt>
+<dd>Size of each quantization block along the K dimension. Currently only block_size=32 is supported by the WebGPU kernel.</dd>
+<dt><tt>epsilon</tt> : float</dt>
+<dd>Epsilon used by the optional fused (Skip)SimplifiedLayerNormalization. Defaults to 1e-5.</dd>
+</dl>
+
+#### Inputs (8 - 9)
+
+<dl>
+<dt><tt>A</tt> : T1</dt>
+<dd>The shared input tensor.</dd>
+<dt><tt>skip</tt> (optional) : T1</dt>
+<dd>Optional skip input used by SkipSimplifiedLayerNormalization.</dd>
+<dt><tt>norm_scale</tt> (optional) : T1</dt>
+<dd>Optional RMSNorm scale with shape [K] used by SimplifiedLayerNormalization or SkipSimplifiedLayerNormalization.</dd>
+<dt><tt>gate_B</tt> : T2</dt>
+<dd>Packed uint8 tensor for the gate projection weights.</dd>
+<dt><tt>gate_scales</tt> : T1</dt>
+<dd>Per-block scaling factors for the gate projection.</dd>
+<dt><tt>gate_bias</tt> (optional) : T1</dt>
+<dd>Optional bias for the gate projection with shape [N].</dd>
+<dt><tt>up_B</tt> : T2</dt>
+<dd>Packed uint8 tensor for the up projection weights.</dd>
+<dt><tt>up_scales</tt> : T1</dt>
+<dd>Per-block scaling factors for the up projection.</dd>
+<dt><tt>up_bias</tt> (optional) : T1</dt>
+<dd>Optional bias for the up projection with shape [N].</dd>
+</dl>
+
+#### Outputs (1 - 2)
+
+<dl>
+<dt><tt>Y</tt> : T1</dt>
+<dd>The fused gated MLP output tensor.</dd>
+<dt><tt>input_skip_bias_sum</tt> (optional) : T1</dt>
+<dd>Optional residual-sum output for SkipSimplifiedLayerNormalization.</dd>
+</dl>
+
+#### Type Constraints
+
+<dl>
+<dt><tt>T1</tt> : tensor(float), tensor(float16), tensor(bfloat16)</dt>
+<dd>Constrain input and output types to float tensors.</dd>
+<dt><tt>T2</tt> : tensor(uint8)</dt>
+<dd>Constrain quantized weight types to uint8.</dd>
+</dl>
+
+
+### <a name="com.microsoft.MatMulNBitsQkv"></a><a name="com.microsoft.matmulnbitsqkv">**com.microsoft.MatMulNBitsQkv**</a>
+
+  MatMulNBitsQkv fuses either SimplifiedLayerNormalization (RMSNorm)
+  or SkipSimplifiedLayerNormalization with three MatMulNBits projections that share the
+  same normalized activation.
+  
+    A_norm = SimplifiedLayerNormalization(A, norm_scale, epsilon)
+    Q = MatMulNBits(A_norm, q_weight) + q_bias
+    K = MatMulNBits(A_norm, k_weight) + k_bias
+    V = MatMulNBits(A_norm, v_weight) + v_bias
+  
+  If skip is provided, the operator computes the SkipSimplifiedLayerNormalization variant
+  and may also return the input+skip residual sum as output 3.
+  
+  This operator is intended as a decode-oriented QKV fusion primitive.
+
+#### Version
+
+This version of the operator has been available since version 1 of the 'com.microsoft' operator set.
+
+#### Attributes
+
+<dl>
+<dt><tt>K</tt> : int (required)</dt>
+<dd>Input feature dimension shared by the normalized input and all projection weights.</dd>
+<dt><tt>Nkv</tt> : int (required)</dt>
+<dd>Output feature dimension shared by the K and V projections.</dd>
+<dt><tt>Nq</tt> : int (required)</dt>
+<dd>Output feature dimension of the Q projection.</dd>
+<dt><tt>accuracy_level</tt> : int</dt>
+<dd>The minimum accuracy level of input A. It follows the same semantics as MatMulNBits.</dd>
+<dt><tt>bits</tt> : int</dt>
+<dd>Bit-width used to quantize all weight matrices. Currently only bits=4 is supported by the WebGPU kernel.</dd>
+<dt><tt>block_size</tt> : int (required)</dt>
+<dd>Size of each quantization block along the K dimension. Currently only block_size=32 is supported by the WebGPU kernel.</dd>
+<dt><tt>epsilon</tt> : float</dt>
+<dd>Epsilon used by the simplified layer norm reduction.</dd>
+</dl>
+
+#### Inputs (11 - 12)
+
+<dl>
+<dt><tt>A</tt> : T1</dt>
+<dd>The shared input tensor.</dd>
+<dt><tt>skip</tt> (optional) : T1</dt>
+<dd>Optional residual input for SkipSimplifiedLayerNormalization.</dd>
+<dt><tt>norm_scale</tt> : T1</dt>
+<dd>Scale input for the simplified layer norm with shape [K].</dd>
+<dt><tt>q_B</tt> : T2</dt>
+<dd>Packed uint8 tensor for the Q projection weights.</dd>
+<dt><tt>q_scales</tt> : T1</dt>
+<dd>Per-block scaling factors for the Q projection.</dd>
+<dt><tt>q_bias</tt> (optional) : T1</dt>
+<dd>Optional bias for the Q projection with shape [Nq].</dd>
+<dt><tt>k_B</tt> : T2</dt>
+<dd>Packed uint8 tensor for the K projection weights.</dd>
+<dt><tt>k_scales</tt> : T1</dt>
+<dd>Per-block scaling factors for the K projection.</dd>
+<dt><tt>k_bias</tt> (optional) : T1</dt>
+<dd>Optional bias for the K projection with shape [Nkv].</dd>
+<dt><tt>v_B</tt> : T2</dt>
+<dd>Packed uint8 tensor for the V projection weights.</dd>
+<dt><tt>v_scales</tt> : T1</dt>
+<dd>Per-block scaling factors for the V projection.</dd>
+<dt><tt>v_bias</tt> (optional) : T1</dt>
+<dd>Optional bias for the V projection with shape [Nkv].</dd>
+</dl>
+
+#### Outputs (3 - 4)
+
+<dl>
+<dt><tt>Q</tt> : T1</dt>
+<dd>The Q projection output tensor.</dd>
+<dt><tt>K</tt> : T1</dt>
+<dd>The K projection output tensor.</dd>
+<dt><tt>V</tt> : T1</dt>
+<dd>The V projection output tensor.</dd>
+<dt><tt>input_skip_bias_sum</tt> (optional) : T1</dt>
+<dd>Optional residual-sum output for SkipSimplifiedLayerNormalization.</dd>
+</dl>
+
+#### Type Constraints
+
+<dl>
+<dt><tt>T1</tt> : tensor(float), tensor(float16), tensor(bfloat16)</dt>
+<dd>Constrain input and output types to float tensors.</dd>
+<dt><tt>T2</tt> : tensor(uint8)</dt>
+<dd>Constrain quantized weight types to uint8.</dd>
 </dl>
 
 
@@ -3569,7 +3897,6 @@ This version of the operator has been available since version 1 of the 'com.micr
 ### <a name="com.microsoft.NhwcFusedConv"></a><a name="com.microsoft.nhwcfusedconv">**com.microsoft.NhwcFusedConv**</a>
 
   NhwcFusedConv is a Conv operator with optional activation and add operators fused in.
-  Only has fp16 implementation as of 2023/04/15.
 
 #### Version
 
@@ -3600,26 +3927,26 @@ This version of the operator has been available since version 1 of the 'com.micr
 
 <dl>
 <dt><tt>X</tt> : T</dt>
-<dd></dd>
+<dd>Input activation tensor in channels-last layout. For 2D convolution this is [N, H, W, C], where N is batch size, H/W are spatial dimensions, and C is the number of input channels.</dd>
 <dt><tt>W</tt> : T</dt>
-<dd></dd>
+<dd>Convolution weight tensor in the standard ONNX Conv filter layout [M, C/group, kH, kW], where M is the number of output channels.</dd>
 <dt><tt>B</tt> (optional) : T</dt>
-<dd></dd>
+<dd>Optional 1D bias tensor of shape [M].</dd>
 <dt><tt>Z</tt> (optional) : T</dt>
-<dd>Tensor to be added to the output, must be the same shape and format as the output tensor.</dd>
+<dd>Optional residual/add tensor in the same channels-last layout and shape as the output tensor Y. For 2D convolution this is [N, out_H, out_W, M].</dd>
 </dl>
 
 #### Outputs
 
 <dl>
 <dt><tt>Y</tt> : T</dt>
-<dd></dd>
+<dd>Output tensor in channels-last layout. For 2D convolution this is [N, out_H, out_W, M], where M is the number of output channels.</dd>
 </dl>
 
 #### Type Constraints
 
 <dl>
-<dt><tt>T</tt> : tensor(float16)</dt>
+<dt><tt>T</tt> : tensor(float16), tensor(float)</dt>
 <dd>Constrain input and output types to float tensors</dd>
 </dl>
 
@@ -4735,22 +5062,26 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dt><tt>activation_type</tt> : string</dt>
 <dd>Activation function to use. Choose from relu, gelu, silu, swiglu and identity. Default is relu</dd>
 <dt><tt>block_size</tt> : int</dt>
-<dd>Size of each quantization block along the K (input feature) dimension. Must be power of two and ≥ 16 (e.g., 16, 32, 64, 128). If provided, both hidden_size and inter_size must be divisible by the block size. Otherwise, there is no blocking and a whole column shares one scaling factor. </dd>
+<dd>Size of each quantization block along the K (input feature) dimension. Must be power of two and ≥ 16 (e.g., 16, 32, 64, 128). Both hidden_size and inter_size must be divisible by the block size. The FP4 modes always use blocking: MXFP4 ('fp4'/'wfp4afp8') is normalized to block_size 32 and NVFP4 ('nvfp4') to block_size 16, even when block_size is omitted. For integer quantization ('int'), omitting block_size means there is no blocking and a whole column shares one scaling factor. </dd>
 <dt><tt>expert_weight_bits</tt> : int</dt>
 <dd>Number of bits used in quantized weights. Supported values are 2, 4, and 8. Default is 4 bits</dd>
 <dt><tt>k</tt> : int</dt>
 <dd>Number of top experts to select from expert pool</dd>
 <dt><tt>normalize_routing_weights</tt> : int</dt>
 <dd>Whether to normalize routing weights</dd>
+<dt><tt>quant_type</tt> : string</dt>
+<dd>Quantization type: 'int' for integer quantization (default), 'fp4' for MXFP4 quantization, 'nvfp4' for NVFP4 quantization, 'fp8' for FP8 e4m3 weight-only quantization, or 'wfp4afp8' for MXFP4 weight with FP8 activation. When quant_type is 'fp4' or 'nvfp4', weights are stored in E2M1 FP4 format (2 values per byte), fc*_scales inputs contain the FP4 block scales, and fc*_global_scale inputs must be provided. 'fp4' uses Float8E8M0 block scales with block_size 32; 'nvfp4' uses Float8E4M3FN block scales with block_size 16.</dd>
 <dt><tt>swiglu_fusion</tt> : int</dt>
 <dd>0: not fused, 1: fused and interleaved. 2: fused and not interleaved.</dd>
 <dt><tt>swiglu_limit</tt> : float</dt>
 <dd>The limit used to clamp inputs in SwiGLU. It is infinite when limit is not provided.</dd>
 <dt><tt>use_sparse_mixer</tt> : int</dt>
 <dd>Whether to use sparse mixer</dd>
+<dt><tt>weights_prepacked</tt> : int</dt>
+<dd>Only meaningful when quant_type='int'. Tri-state control over the layout of the int4/int8 fc1/fc2 weight initializers. The concrete prepacked layouts selected by -1 and 1 are determined by the execution provider. 0: the initializers are raw, un-prepacked [E, N, K/pack] tensors as produced by quantize_matmul_{4,8}bits. Defaults to -1.</dd>
 </dl>
 
-#### Inputs (7 - 15)
+#### Inputs (6 - 21)
 
 <dl>
 <dt><tt>input</tt> : T</dt>
@@ -4759,20 +5090,20 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>2D tensor with shape (num_tokens, num_experts)</dd>
 <dt><tt>fc1_experts_weights</tt> : T1</dt>
 <dd>3D tensor with shape (num_experts, fusion_size * inter_size, hidden_size / pack_size), The fusion_size is 2 for fused swiglu, or 1 otherwise. The pack_size is 8 / expert_weight_bits.</dd>
-<dt><tt>fc1_scales</tt> : T2</dt>
-<dd>2D tensor with shape (num_experts, fusion_size * inter_size), or 3D tensor with shape (num_experts, fusion_size * inter_size, hidden_size / block_size) when block_size is provided.</dd>
+<dt><tt>fc1_scales</tt> (optional) : T2</dt>
+<dd>Optional weight scales. For quant_type='int', this is a 2D tensor with shape (num_experts, fusion_size * inter_size), or a 3D tensor with shape (num_experts, fusion_size * inter_size, hidden_size / block_size) when block_size is provided. For quant_type='fp4' or 'wfp4afp8', this is a float8e8m0 MXFP block-scale tensor with shape (num_experts, fusion_size * inter_size, hidden_size / 32). For quant_type='nvfp4', this is a float8e4m3fn NVFP4 block-scale tensor with shape (num_experts, fusion_size * inter_size, hidden_size / 16). Not used for quant_type='fp8'.</dd>
 <dt><tt>fc1_experts_bias</tt> (optional) : T</dt>
 <dd>2D optional tensor with shape (num_experts, fusion_size * inter_size)</dd>
 <dt><tt>fc2_experts_weights</tt> : T1</dt>
 <dd>3D tensor with shape (num_experts, hidden_size, inter_size / pack_size)</dd>
-<dt><tt>fc2_scales</tt> : T2</dt>
-<dd>2D tensor with shape (num_experts, hidden_size), or 3D tensor with shape (num_experts, hidden_size, inter_size / block_size) when block_size is provided.</dd>
+<dt><tt>fc2_scales</tt> (optional) : T2</dt>
+<dd>Optional weight scales. For quant_type='int', this is a 2D tensor with shape (num_experts, hidden_size), or a 3D tensor with shape (num_experts, hidden_size, inter_size / block_size) when block_size is provided. For quant_type='fp4' or 'wfp4afp8', this is a float8e8m0 MXFP block-scale tensor with shape (num_experts, hidden_size, inter_size / 32). For quant_type='nvfp4', this is a float8e4m3fn NVFP4 block-scale tensor with shape (num_experts, hidden_size, inter_size / 16). Not used for quant_type='fp8'.</dd>
 <dt><tt>fc2_experts_bias</tt> (optional) : T</dt>
 <dd>2D optional tensor with shape (num_experts, hidden_size)</dd>
 <dt><tt>fc3_experts_weights</tt> (optional) : T1</dt>
 <dd>3D optional tensor with shape (num_experts, inter_size, hidden_size / pack_size)</dd>
 <dt><tt>fc3_scales</tt> (optional) : T2</dt>
-<dd>2D optional tensor with shape (num_experts, inter_size), or 3D optional tensor with shape (num_experts, inter_size, hidden_size / block_size) when block_size is provided.</dd>
+<dd>Optional weight scales. For quant_type='int', this is a 2D tensor with shape (num_experts, inter_size), or a 3D tensor with shape (num_experts, inter_size, hidden_size / block_size) when block_size is provided. For quant_type='fp4' or 'wfp4afp8', this is a float8e8m0 MXFP block-scale tensor with shape (num_experts, inter_size, hidden_size / 32). Not used for quant_type='fp8'.</dd>
 <dt><tt>fc3_experts_bias</tt> (optional) : T</dt>
 <dd>2D optional tensor with shape (num_experts, inter_size)</dd>
 <dt><tt>fc1_zero_points</tt> (optional) : T1</dt>
@@ -4783,6 +5114,18 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dd>2D optional tensor with shape (num_experts, inter_size / pack_size), or 3D optional tensor with shape (num_experts, inter_size, hidden_size / block_size / pack_size) when block_size is provided.</dd>
 <dt><tt>router_weights</tt> (optional) : T</dt>
 <dd>2D optional tensor with shape (num_tokens, num_experts). When provided, router_probs is used only for Top-K expert selection, and router_weights is used for aggregating expert outputs (the values at the selected expert indices are gathered and used as mixing weights). This enables DeepSeek-style noaux_tc routing where different tensors are used for selection and aggregation. When not provided, router_probs is used for both selection and aggregation (backward compatible).</dd>
+<dt><tt>fc1_global_scale</tt> (optional) : T4</dt>
+<dd>1D optional tensor with shape (num_experts,). Per-expert global weight scale for FC1. Required when quant_type is 'fp4', 'nvfp4', 'fp8', or 'wfp4afp8'.</dd>
+<dt><tt>fc2_global_scale</tt> (optional) : T4</dt>
+<dd>1D optional tensor with shape (num_experts,). Per-expert global weight scale for FC2. Required when quant_type is 'fp4', 'nvfp4', 'fp8', or 'wfp4afp8'.</dd>
+<dt><tt>fc1_act_scale</tt> (optional) : T4</dt>
+<dd>1D optional tensor with shape (1,) or (num_experts,). Activation scale for FC1 FP8 activation modes.</dd>
+<dt><tt>fc2_act_scale</tt> (optional) : T4</dt>
+<dd>1D optional tensor with shape (1,) or (num_experts,). Activation scale for FC2 FP8 activation modes.</dd>
+<dt><tt>fc1_act_block_scale</tt> (optional) : T2</dt>
+<dd>3D optional float8e8m0 MXFP activation block-scale tensor for FC1 FP8 activation modes.</dd>
+<dt><tt>fc2_act_block_scale</tt> (optional) : T2</dt>
+<dd>3D optional float8e8m0 MXFP activation block-scale tensor for FC2 FP8 activation modes.</dd>
 </dl>
 
 #### Outputs
@@ -4797,10 +5140,12 @@ This version of the operator has been available since version 1 of the 'com.micr
 <dl>
 <dt><tt>T</tt> : tensor(float), tensor(float16), tensor(bfloat16)</dt>
 <dd>Constrain input and output types to float tensors.</dd>
-<dt><tt>T1</tt> : tensor(uint8)</dt>
-<dd>Constrain weights type to uint8 tensors.</dd>
-<dt><tt>T2</tt> : tensor(float), tensor(float16), tensor(bfloat16)</dt>
-<dd>Constrain scales type to float tensors.</dd>
+<dt><tt>T1</tt> : tensor(uint8), tensor(float8e4m3fn)</dt>
+<dd>Constrain quantized weight types. Integer and FP4 weights use uint8. FP8 weights use float8e4m3fn.</dd>
+<dt><tt>T2</tt> : tensor(float), tensor(float16), tensor(bfloat16), tensor(float8e8m0), tensor(float8e4m3fn)</dt>
+<dd>Constrain scale types. Float tensors are used for integer quantization scales. Float8e8m0 tensors are used for MXFP4 block scales; float8e4m3fn tensors are used for NVFP4 block scales.</dd>
+<dt><tt>T4</tt> : tensor(float)</dt>
+<dd>Constrain FP4 global scale type to float32 tensors.</dd>
 </dl>
 
 

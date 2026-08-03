@@ -58,6 +58,13 @@ class GroupQueryAttention final : public WebGpuKernel {
     use_smooth_softmax_ = info.GetAttrOrDefault<int64_t>("smooth_softmax", 0) == 1;
 
     local_window_size_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("local_window_size", -1));
+
+    // The windowed KV cache (cache-relative indexing + shift compaction) is implemented only by the
+    // CUDA kernel. Fail loudly rather than treating the window-sized buffer as a full-length cache.
+    ORT_ENFORCE(info.GetAttrOrDefault<int64_t>("sliding_window_cache", 0) == 0,
+                "GroupQueryAttention (WebGPU): sliding_window_cache=1 is not implemented.");
+
+    qk_norm_epsilon_ = info.GetAttrOrDefault<float>("qk_norm_epsilon", 1e-6f);
   }
 
   int num_heads_;     // number of attention heads of Q
@@ -69,6 +76,10 @@ class GroupQueryAttention final : public WebGpuKernel {
   int local_window_size_;
 
   bool use_smooth_softmax_;
+  // Epsilon used by per-head RMSNorm when q_norm_weight / k_norm_weight (inputs 14 / 15) are
+  // provided. Consumed whenever those optional norm inputs are used (decode fast path or
+  // prefill fallback), and ignored otherwise.
+  float qk_norm_epsilon_;
   Status ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const override;
 };
 
